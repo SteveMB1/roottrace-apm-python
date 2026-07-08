@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roottrace-apm"
+version = "0.1.0"
+description = "RootTrace APM agent for Python: transactions, spans, error capture, outbound HTTP monitoring, and custom metrics with zero dependencies."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "RootTrace" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["apm", "monitoring", "metrics", "tracing", "observability", "roottrace"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/SteveMB1/roottrace-apm"
+Repository = "https://github.com/SteveMB1/roottrace-apm"
+Issues = "https://github.com/SteveMB1/roottrace-apm/issues"
+Changelog = "https://github.com/SteveMB1/roottrace-apm/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+roottrace_apm = ["py.typed"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
