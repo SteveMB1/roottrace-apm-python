@@ -1,7 +1,35 @@
+Metadata-Version: 2.4
+Name: roottrace_apm
+Version: 0.1.0
+Summary: RootTrace APM agent for Python: transactions, spans, error capture, outbound HTTP monitoring, and custom metrics with zero dependencies.
+Author: RootTrace
+License: Apache-2.0
+Project-URL: Homepage, https://github.com/SteveMB1/roottrace_apm
+Project-URL: Repository, https://github.com/SteveMB1/roottrace_apm
+Project-URL: Issues, https://github.com/SteveMB1/roottrace_apm/issues
+Project-URL: Changelog, https://github.com/SteveMB1/roottrace_apm/blob/main/CHANGELOG.md
+Keywords: apm,monitoring,metrics,tracing,observability,roottrace
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Topic :: System :: Monitoring
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
 # roottrace_apm
 
-[![PyPI](https://img.shields.io/pypi/v/roottrace-apm)](https://pypi.org/project/roottrace-apm/)
-[![CI](https://github.com/SteveMB1/roottrace-apm/actions/workflows/ci.yml/badge.svg)](https://github.com/SteveMB1/roottrace-apm/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/roottrace_apm)](https://pypi.org/project/roottrace_apm/)
+[![CI](https://github.com/SteveMB1/roottrace_apm/actions/workflows/ci.yml/badge.svg)](https://github.com/SteveMB1/roottrace_apm/actions/workflows/ci.yml)
 
 RootTrace APM agent for Python. Aggregates counters, gauges, timers,
 transactions, spans, and errors in memory and posts one payload per flush
@@ -94,39 +122,18 @@ except ValueError as exc:
 Errors group by a stable fingerprint (type + culprit + top stack frames),
 at most 25 distinct per flush.
 
-### Outbound HTTP (requests, urllib3, urllib, httpx, aiohttp)
+### Outbound HTTP (requests, urllib3, urllib)
 
 `init()` instruments the stdlib `http.client` unless you pass
 `http_instrumentation=False`. That covers everything built on it —
 `requests`, `urllib3` (both 1.x and 2.x), and `urllib` — with no extra
-setup. When `httpx` or `aiohttp` is installed, their clients are
-instrumented the same way (a redirect chain followed by httpx is recorded
-as one call against the original destination).
-Every outbound call records a `http.client.duration` timer and a
+setup. Clients with their own HTTP stacks (`httpx`, `aiohttp`) are not
+covered. Every outbound call records a `http.client.duration` timer and a
 `http.client.requests` counter tagged
 `{"destination": "host:port", "status": "2xx"}`; calls that fail without a
 response (connection refused, timeout) are recorded with status `error`.
 Inside a transaction the call also becomes an `http` span, and a W3C
 `traceparent` header is injected so traces connect across services.
-
-### Databases (MongoDB, Elasticsearch, Redis, PostgreSQL, SQLAlchemy)
-
-`init()` also auto-instruments whichever supported database clients are
-installed, unless you pass `db_instrumentation=False`. No code changes:
-inside a transaction each operation becomes a `db` span named by
-operation and target — `find app.users` (mongodb), `SELECT users`
-(postgresql/mysql/sqlite via SQLAlchemy or asyncpg), `GET` (redis),
-`POST /idx/_search` (elasticsearch) — never by query payload or key.
-
-- **MongoDB** — a `pymongo` command listener; works with `motor` too.
-  Call `init()` *before* constructing the client: pymongo only applies
-  listeners to clients created afterwards.
-- **Elasticsearch** — `perform_request` on the sync and async clients.
-  The transport's own HTTP call is folded into the db span so one query
-  is one waterfall row.
-- **Redis** — `redis-py`, sync and asyncio.
-- **PostgreSQL** — `asyncpg` connection methods; anything running
-  through **SQLAlchemy** (any dialect) is covered via engine events.
 
 ### WSGI
 
@@ -144,19 +151,6 @@ segments (numbers, UUIDs, hex ids of 16+ chars) collapsed to `:id` (pass
 `traceparent` header is adopted, so distributed requests share one trace id.
 5xx responses and raised exceptions mark the transaction failed; exceptions
 are captured and re-raised.
-
-Sampled requests also carry request context — origin IP, user agent,
-method, real path with query string, and status code — shown on the
-dashboard's trace view. `client_ip` is the first `X-Forwarded-For` hop
-when present (client-controlled, so spoofable unless your edge proxy
-overwrites the header); `remote_ip` is always the socket peer the kernel
-vouches for. Custom instrumentation can attach the same context to any
-transaction:
-
-```python
-with apm.transaction("consume orders", type="task") as tx:
-    tx.set_http(client_ip=peer, method="GET", path=raw_path, status_code=200)
-```
 
 ## Configuration
 

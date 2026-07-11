@@ -3,8 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "roottrace-apm"
-version = "0.1.0"
+name = "roottrace_apm"
+version = "0.2.0"
 description = "RootTrace APM agent for Python: transactions, spans, error capture, outbound HTTP monitoring, and custom metrics with zero dependencies."
 readme = "README.md"
 license = { text = "Apache-2.0" }

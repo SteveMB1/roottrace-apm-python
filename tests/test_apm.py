@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import http.client
 import http.server
 import json
@@ -6,12 +7,39 @@ import os
 import socket
 import threading
 import time
+import types
 import unittest
+from unittest import mock
 
 try:
     import requests
 except ImportError:  # the end-to-end urllib3 test is optional
     requests = None
+
+try:
+    import httpx
+except ImportError:  # the httpx tests are optional
+    httpx = None
+
+try:
+    import aiohttp
+except ImportError:  # the aiohttp tests are optional
+    aiohttp = None
+
+try:
+    import pymongo  # noqa: F401  (presence check only)
+except ImportError:  # the mongodb listener tests are optional
+    pymongo = None
+
+try:
+    import motor.frameworks.asyncio as motor_asyncio_framework
+except ImportError:  # the motor context tests are optional
+    motor_asyncio_framework = None
+
+try:
+    import elasticsearch
+except ImportError:  # the elasticsearch patch test is optional
+    elasticsearch = None
 
 import roottrace_apm as apm_mod
 from roottrace_apm import (
@@ -89,7 +117,7 @@ class ApmTest(ApmTestCase):
             set(payload["runtime"]), {"language_version", "pid", "wrapper_version"}
         )
         self.assertEqual(payload["runtime"]["pid"], os.getpid())
-        self.assertEqual(payload["runtime"]["wrapper_version"], "0.1.0")
+        self.assertEqual(payload["runtime"]["wrapper_version"], apm_mod.VERSION)
 
         metrics = {m["name"]: m for m in payload["metrics"]}
         self.assertEqual(
@@ -823,6 +851,45 @@ class WsgiTest(ApmTestCase):
         (sample,) = self.apm._trace_samples
         self.assertRegex(sample["trace_id"], "^[0-9a-f]{32}$")
 
+    def test_captures_http_context_on_trace_sample(self):
+        mw = WsgiMiddleware(self._app())
+        self._run(mw, "/orders/7", QUERY_STRING="page=2",
+                  REMOTE_ADDR="10.0.0.9",
+                  HTTP_X_FORWARDED_FOR="203.0.113.7, 10.0.0.1",
+                  HTTP_USER_AGENT="pytest-agent")
+
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["http"], {
+            "method": "GET",
+            "path": "/orders/7?page=2",
+            "client_ip": "203.0.113.7",  # first X-Forwarded-For hop
+            "remote_ip": "10.0.0.9",     # the socket peer, kept alongside
+            "user_agent": "pytest-agent",
+            "status_code": 200,
+        })
+
+    def test_http_context_without_proxy_uses_peer_address(self):
+        mw = WsgiMiddleware(self._app("404 Not Found"))
+        self._run(mw, "/missing", REMOTE_ADDR="10.0.0.9")
+
+        (sample,) = self.apm._trace_samples
+        http = sample["http"]
+        self.assertEqual(http["client_ip"], "10.0.0.9")
+        self.assertEqual(http["remote_ip"], "10.0.0.9")  # always the socket peer
+        self.assertNotIn("user_agent", http)
+        self.assertEqual(http["status_code"], 404)
+        self.assertEqual(http["path"], "/missing")
+
+    def test_malformed_status_never_raises(self):
+        # "²00" passes isdigit() but int() rejects it; the middleware must
+        # swallow it, keep serving, and just omit the status code.
+        mw = WsgiMiddleware(self._app("²00 Weird"))
+        body = self._run(mw, "/odd", REMOTE_ADDR="10.0.0.9")
+
+        self.assertEqual(body, b"ok")
+        (sample,) = self.apm._trace_samples
+        self.assertNotIn("status_code", sample["http"])
+
     def test_5xx_marks_failed(self):
         mw = WsgiMiddleware(self._app("500 Internal Server Error"))
         self._run(mw, "/boom")
@@ -951,6 +1018,92 @@ class RequestsInstrumentationTest(ApmTestCase):
         self.assertEqual(http_span["name"], f"GET {destination}")
 
 
+@unittest.skipUnless(httpx is not None, "httpx is not installed")
+class HttpxInstrumentationTest(ApmTestCase):
+    def test_sync_client_instrumented_end_to_end(self):
+        received = []
+        server = _local_http_server(received)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        apm_mod._instrument_httpx()
+        patched = httpx.Client.send
+        apm_mod._instrument_httpx()  # idempotent: no double patch
+        self.assertIs(httpx.Client.send, patched)
+
+        with apm_mod.transaction("GET /via-httpx") as tx:
+            with httpx.Client(trust_env=False) as client:
+                response = client.get(f"http://127.0.0.1:{port}/data", timeout=5)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "ok")
+
+        # the server saw a well-formed traceparent carrying the trace id
+        (headers,) = received
+        self.assertRegex(headers.get("traceparent", ""),
+                         f"^00-{tx.trace_id}-[0-9a-f]{{16}}-01$")
+
+        destination = f"127.0.0.1:{port}"
+        tags_key = f"destination={destination},status=2xx"
+        timer_entry = self.apm._buffer[("http.client.duration", tags_key)]
+        self.assertEqual(timer_entry["kind"], "timer")
+        self.assertEqual(timer_entry["count"], 1)
+        self.assertEqual(self.apm._buffer[("http.client.requests", tags_key)]["count"], 1)
+
+        group = self.apm._tx_buffer[("GET /via-httpx", "request")]
+        self.assertEqual(group["spans"][("http", destination)]["count"], 1)
+        (sample,) = self.apm._trace_samples
+        (http_span,) = sample["spans"]
+        self.assertEqual(http_span["name"], f"GET {destination}")
+        self.assertEqual(http_span["subtype"], destination)
+
+    def test_async_client_instrumented_end_to_end(self):
+        received = []
+        server = _local_http_server(received)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        apm_mod._instrument_httpx()
+
+        async def call():
+            async with httpx.AsyncClient(trust_env=False) as client:
+                return await client.get(f"http://127.0.0.1:{port}/data", timeout=5)
+
+        with apm_mod.transaction("GET /via-httpx-async") as tx:
+            response = asyncio.run(call())
+        self.assertEqual(response.status_code, 200)
+
+        (headers,) = received
+        self.assertRegex(headers.get("traceparent", ""),
+                         f"^00-{tx.trace_id}-[0-9a-f]{{16}}-01$")
+
+        destination = f"127.0.0.1:{port}"
+        tags_key = f"destination={destination},status=2xx"
+        self.assertEqual(self.apm._buffer[("http.client.duration", tags_key)]["count"], 1)
+        group = self.apm._tx_buffer[("GET /via-httpx-async", "request")]
+        self.assertEqual(group["spans"][("http", destination)]["count"], 1)
+
+    def test_failed_call_records_error_status(self):
+        apm_mod._instrument_httpx()
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens here anymore
+
+        with apm_mod.transaction("GET /down-httpx"):
+            with httpx.Client(trust_env=False) as client:
+                with self.assertRaises(httpx.ConnectError):
+                    client.get(f"http://127.0.0.1:{port}/", timeout=1)
+
+        destination = f"127.0.0.1:{port}"
+        tags_key = f"destination={destination},status=error"
+        self.assertEqual(self.apm._buffer[("http.client.requests", tags_key)]["count"], 1)
+        self.assertEqual(self.apm._buffer[("http.client.duration", tags_key)]["count"], 1)
+        group = self.apm._tx_buffer[("GET /down-httpx", "request")]
+        self.assertEqual(group["spans"][("http", destination)]["count"], 1)
+
+
 class PayloadAndMergeBackTest(ApmTestCase):
     def _capture_value_error(self):
         try:
@@ -1050,6 +1203,244 @@ class PayloadAndMergeBackTest(ApmTestCase):
         # the two slowest of both sample sets survive, slowest first
         durations = [s["duration_ms"] for s in payload["trace_samples"]]
         self.assertEqual(durations, [300.0, 100.0])
+
+
+class KubernetesContextTest(unittest.TestCase):
+    """Kubernetes context detection and payload shape (PROTOCOL.md)."""
+
+    POD = "checkout-api-7d9f8b6c5d-x2k4p"
+
+    def _apm(self, hostname="web-1", env_vars=None, **kwargs):
+        # Blank defaults neutralize any real values leaking in from the host;
+        # env() strips, so "" behaves like unset. Both patches end before the
+        # Apm is returned: detection must have run once, at init.
+        overrides = {
+            "KUBERNETES_SERVICE_HOST": "",
+            "ROOTTRACE_APM_DEPLOYMENT": "",
+            "ROOTTRACE_APM_NAMESPACE": "",
+        }
+        overrides.update(env_vars or {})
+        with mock.patch.dict(os.environ, overrides), \
+                mock.patch("socket.gethostname", return_value=hostname):
+            return Apm(service="svc", token="rtc_test",
+                       api_url="https://api.example/api", interval_seconds=5,
+                       runtime_metrics=False, **kwargs)
+
+    def _payload(self, apm):
+        return apm._build_payload({}, {}, {}, [])
+
+    def test_explicit_env_vars_win_over_detection(self):
+        apm = self._apm(
+            hostname=self.POD,
+            env_vars={"KUBERNETES_SERVICE_HOST": "10.0.0.1",
+                      "ROOTTRACE_APM_DEPLOYMENT": " checkout ",
+                      "ROOTTRACE_APM_NAMESPACE": "prod"},
+        )
+        self.assertEqual(apm.deployment, "checkout")  # trimmed, not derived
+        self.assertEqual(apm.namespace, "prod")
+        self.assertEqual(
+            self._payload(apm)["kubernetes"],
+            {"deployment": "checkout", "namespace": "prod", "pod": self.POD},
+        )
+
+    def test_init_arguments_win_over_env_vars(self):
+        apm = self._apm(
+            env_vars={"ROOTTRACE_APM_DEPLOYMENT": "from-env"},
+            deployment="from-arg", namespace=123,  # str()-coerced
+        )
+        self.assertEqual(apm.deployment, "from-arg")
+        self.assertEqual(apm.namespace, "123")
+
+    def test_deployment_derived_from_replicaset_pod_name(self):
+        apm = self._apm(hostname=self.POD,
+                        env_vars={"KUBERNETES_SERVICE_HOST": "10.0.0.1"})
+        self.assertEqual(apm.deployment, "checkout-api")
+        kubernetes = self._payload(apm)["kubernetes"]
+        self.assertEqual(kubernetes["deployment"], "checkout-api")
+        self.assertEqual(kubernetes["pod"], self.POD)
+        # the serviceaccount namespace file is unreadable here
+        self.assertNotIn("namespace", kubernetes)
+
+    def test_deployment_derived_from_statefulset_pod_name(self):
+        apm = self._apm(hostname="kafka-2",
+                        env_vars={"KUBERNETES_SERVICE_HOST": "10.0.0.1"})
+        self.assertEqual(apm.deployment, "kafka")
+
+    def test_unrecognized_pod_name_sent_as_is(self):
+        apm = self._apm(hostname="oddly.named.host",
+                        env_vars={"KUBERNETES_SERVICE_HOST": "10.0.0.1"})
+        self.assertEqual(apm.deployment, "oddly.named.host")
+
+    def test_outside_kubernetes_payload_has_no_kubernetes_key(self):
+        apm = self._apm()
+        self.assertIsNone(apm.deployment)
+        self.assertIsNone(apm.namespace)
+        self.assertNotIn("kubernetes", self._payload(apm))
+
+    def test_names_truncated_at_253_chars(self):
+        apm = self._apm(deployment="d" * 300, namespace="n" * 300)
+        self.assertEqual(apm.deployment, "d" * 253)
+        self.assertEqual(apm.namespace, "n" * 253)
+
+
+class SqlSpanNameTest(unittest.TestCase):
+    def test_operation_and_table(self):
+        self.assertEqual(apm_mod._sql_span_name("SELECT * FROM users WHERE id = 1"),
+                         "SELECT users")
+        self.assertEqual(apm_mod._sql_span_name("insert into orders values (1)"),
+                         "INSERT orders")
+        self.assertEqual(apm_mod._sql_span_name("UPDATE public.accounts SET x=1"),
+                         "UPDATE public.accounts")
+        self.assertEqual(apm_mod._sql_span_name("BEGIN"), "BEGIN")
+        self.assertEqual(apm_mod._sql_span_name(""), "SQL")
+
+
+@unittest.skipUnless(aiohttp is not None, "aiohttp is not installed")
+class AiohttpInstrumentationTest(ApmTestCase):
+    def test_client_session_instrumented_end_to_end(self):
+        received = []
+        server = _local_http_server(received)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        apm_mod._instrument_aiohttp()
+        patched = aiohttp.ClientSession._request
+        apm_mod._instrument_aiohttp()  # idempotent: no double patch
+        self.assertIs(aiohttp.ClientSession._request, patched)
+
+        async def call():
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/data") as response:
+                    await response.read()
+                    return response.status
+
+        with apm_mod.transaction("GET /via-aiohttp") as tx:
+            status = asyncio.run(call())
+        self.assertEqual(status, 200)
+
+        (headers,) = received
+        self.assertRegex(headers.get("traceparent", ""),
+                         f"^00-{tx.trace_id}-[0-9a-f]{{16}}-01$")
+
+        destination = f"127.0.0.1:{port}"
+        tags_key = f"destination={destination},status=2xx"
+        self.assertEqual(self.apm._buffer[("http.client.duration", tags_key)]["count"], 1)
+        self.assertEqual(self.apm._buffer[("http.client.requests", tags_key)]["count"], 1)
+        group = self.apm._tx_buffer[("GET /via-aiohttp", "request")]
+        self.assertEqual(group["spans"][("http", destination)]["count"], 1)
+        (sample,) = self.apm._trace_samples
+        (span,) = sample["spans"]
+        self.assertEqual(span["name"], f"GET {destination}")
+
+
+@unittest.skipUnless(httpx is not None, "httpx is not installed")
+class SpanSuppressionTest(ApmTestCase):
+    def test_suppressed_call_keeps_metrics_but_not_span(self):
+        # The db instrumentation (e.g. Elasticsearch) sets suppression while
+        # its transport runs: metrics still count, the waterfall shows one
+        # logical operation instead of two.
+        server = _local_http_server([])
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        apm_mod._instrument_httpx()
+
+        with apm_mod.transaction("GET /suppressed"):
+            token = apm_mod._span_suppressed.set(True)
+            try:
+                with httpx.Client(trust_env=False) as client:
+                    client.get(f"http://127.0.0.1:{port}/data", timeout=5)
+            finally:
+                apm_mod._span_suppressed.reset(token)
+
+        destination = f"127.0.0.1:{port}"
+        tags_key = f"destination={destination},status=2xx"
+        self.assertEqual(self.apm._buffer[("http.client.requests", tags_key)]["count"], 1)
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["spans"], [])
+
+
+def _mongo_event(command_name, request_id, duration_micros=1500,
+                 database_name="app", command=None):
+    return types.SimpleNamespace(
+        command_name=command_name,
+        request_id=request_id,
+        duration_micros=duration_micros,
+        database_name=database_name,
+        command=command if command is not None else {command_name: "users"},
+    )
+
+
+@unittest.skipUnless(pymongo is not None, "pymongo is not installed")
+class MongoListenerTest(ApmTestCase):
+    def test_command_becomes_a_db_span(self):
+        listener = apm_mod._make_mongo_listener()
+        with apm_mod.transaction("GET /mongo"):
+            listener.started(_mongo_event("find", request_id=7))
+            listener.succeeded(_mongo_event("find", request_id=7))
+
+        group = self.apm._tx_buffer[("GET /mongo", "request")]
+        self.assertEqual(group["spans"][("db", "mongodb")]["count"], 1)
+        (sample,) = self.apm._trace_samples
+        (span,) = sample["spans"]
+        self.assertEqual(span["name"], "find app.users")
+        self.assertEqual(span["duration_ms"], 1.5)
+
+    def test_failed_command_still_recorded(self):
+        listener = apm_mod._make_mongo_listener()
+        with apm_mod.transaction("GET /mongo-fail"):
+            listener.started(_mongo_event("update", request_id=9))
+            listener.failed(_mongo_event("update", request_id=9))
+        (sample,) = self.apm._trace_samples
+        (span,) = sample["spans"]
+        self.assertEqual(span["name"], "update app.users")
+
+    def test_handshake_commands_are_skipped(self):
+        listener = apm_mod._make_mongo_listener()
+        with apm_mod.transaction("GET /mongo-noise"):
+            listener.started(_mongo_event("hello", request_id=1))
+            listener.succeeded(_mongo_event("hello", request_id=1))
+            listener.started(_mongo_event("ping", request_id=2, command={}))
+            listener.succeeded(_mongo_event("ping", request_id=2, command={}))
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["spans"], [])
+
+    def test_no_transaction_is_a_noop(self):
+        listener = apm_mod._make_mongo_listener()
+        listener.started(_mongo_event("find", request_id=3))
+        listener.succeeded(_mongo_event("find", request_id=3))
+        self.assertEqual(self.apm._trace_samples, [])
+
+
+@unittest.skipUnless(motor_asyncio_framework is not None, "motor is not installed")
+class MotorContextTest(unittest.TestCase):
+    def test_executor_calls_see_the_callers_context(self):
+        apm_mod._patch_motor_context()
+        self.assertTrue(motor_asyncio_framework._roottrace_apm_context)
+        before = motor_asyncio_framework.run_on_executor
+        apm_mod._patch_motor_context()  # idempotent
+        self.assertIs(motor_asyncio_framework.run_on_executor, before)
+
+        var = contextvars.ContextVar("motor-test", default=None)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            var.set("visible")
+            return await motor_asyncio_framework.run_on_executor(loop, var.get)
+
+        self.assertEqual(asyncio.run(run()), "visible")
+
+
+@unittest.skipUnless(elasticsearch is not None, "elasticsearch is not installed")
+class ElasticsearchPatchTest(unittest.TestCase):
+    def test_perform_request_is_wrapped(self):
+        apm_mod._instrument_elasticsearch()
+        self.assertTrue(hasattr(elasticsearch.Elasticsearch.perform_request,
+                                "__wrapped__"))
+        before = elasticsearch.Elasticsearch.perform_request
+        apm_mod._instrument_elasticsearch()  # idempotent
+        self.assertIs(elasticsearch.Elasticsearch.perform_request, before)
 
 
 if __name__ == "__main__":

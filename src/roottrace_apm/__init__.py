@@ -34,17 +34,17 @@ try:
 except ImportError:  # not available on Windows
     resource = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_API_URL = "https://api.roottrace.io/api"
-MAX_ENTRIES = 200  # wire cap per ingest request
+MAX_ENTRIES = 500  # wire cap per ingest request
 MAX_USER_ENTRIES = MAX_ENTRIES - 8  # headroom so runtime metrics fit under the cap
 MAX_TAG_KEYS = 8
 MAX_NAME_LENGTH = 200
-MAX_TX_GROUPS = 100  # transaction groups per flush (PROTOCOL.md)
-MAX_TX_BREAKDOWN_ROWS = 20  # span-breakdown rows per transaction group
+MAX_TX_GROUPS = 250  # transaction groups per flush (PROTOCOL.md)
+MAX_TX_BREAKDOWN_ROWS = 40  # span-breakdown rows per transaction group
 MAX_TX_TYPE_LENGTH = 40
 MAX_SUBTYPE_LENGTH = 200
-MAX_ERRORS = 25  # distinct error fingerprints per flush
+MAX_ERRORS = 50  # distinct error fingerprints per flush
 MAX_MESSAGE_LENGTH = 1000
 MAX_CULPRIT_LENGTH = 300
 MAX_STACK_FRAMES = 50
@@ -52,9 +52,14 @@ MAX_ERROR_TYPE_LENGTH = 200
 MAX_FRAME_FUNCTION_LENGTH = 300
 MAX_FRAME_FILE_LENGTH = 1024
 MAX_SERVICE_VERSION_LENGTH = 64
+MAX_K8S_NAME_LENGTH = 253  # DNS-1123 cap on Kubernetes names (PROTOCOL.md)
+K8S_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 RESERVED_METRIC_NAME = "errors.count"  # the server folds error rollups into this name
 MAX_TRACE_SAMPLES = 2  # slowest transactions kept per flush
 MAX_SAMPLE_SPANS = 100  # spans kept on one trace sample
+MAX_HTTP_PATH_LENGTH = 1024  # http context on trace samples (PROTOCOL.md)
+MAX_HTTP_USER_AGENT_LENGTH = 300
+MAX_HTTP_IP_LENGTH = 64  # fits IPv6 with a zone id
 
 logger = logging.getLogger("roottrace_apm")
 
@@ -74,6 +79,11 @@ _active_transaction = contextvars.ContextVar("roottrace_apm_transaction", defaul
 # can't pop each other's starts (a task's set() only affects its own context).
 _timer_starts = contextvars.ContextVar("roottrace_apm_timer_starts", default=())
 _span_starts = contextvars.ContextVar("roottrace_apm_span_starts", default=())
+
+# True while a database client (Elasticsearch, ...) is inside its own
+# instrumented call: the HTTP hooks then skip their span so one logical
+# operation doesn't show up twice in the waterfall. Metrics still record.
+_span_suppressed = contextvars.ContextVar("roottrace_apm_span_suppressed", default=False)
 
 
 def _stack_push(var, entry):
@@ -132,6 +142,31 @@ def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+# Deployment pods look like <name>-<replicaset-hash>-<suffix>; StatefulSet
+# pods look like <name>-<ordinal>. Names matching neither are sent as-is.
+_K8S_DEPLOYMENT_POD_RE = re.compile(r"^(.+)-[a-z0-9]{5,10}-[a-z0-9]{5}$")
+_K8S_STATEFULSET_POD_RE = re.compile(r"^(.+)-\d+$")
+
+
+def _sanitize_k8s_name(value):
+    """Coerce, trim, and truncate one Kubernetes name; None when empty."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    if len(value) > MAX_K8S_NAME_LENGTH:
+        logger.warning("kubernetes name %r longer than %d chars; truncating",
+                       value, MAX_K8S_NAME_LENGTH)
+        value = value[:MAX_K8S_NAME_LENGTH]
+    return value
+
+
+def _deployment_from_pod(pod):
+    match = _K8S_DEPLOYMENT_POD_RE.match(pod) or _K8S_STATEFULSET_POD_RE.match(pod)
+    return match.group(1) if match else pod
+
+
 def _tags_key(tags):
     # Canonical k=v,k=v form (PROTOCOL.md): percent-encode %, =, and , in
     # keys and values so distinct tag maps never collide. '%' goes first.
@@ -157,7 +192,8 @@ class Apm:
     """Aggregation buffer plus the background flush loop."""
 
     def __init__(self, service, token, api_url=DEFAULT_API_URL, interval_seconds=30,
-                 tags=None, runtime_metrics=True, service_version=None):
+                 tags=None, runtime_metrics=True, service_version=None,
+                 deployment=None, namespace=None):
         self.service = service
         self.token = token
         self._api_url = api_url.rstrip("/")
@@ -171,6 +207,7 @@ class Apm:
         self.runtime_metrics = runtime_metrics
         self.service_version = service_version
         self.hostname = socket.gethostname()
+        self._kubernetes = self._detect_kubernetes(deployment, namespace)
         self._buffer = {}
         self._tx_buffer = {}  # (name, type) -> transaction group
         self._error_buffer = {}  # fingerprint -> error entry
@@ -197,9 +234,53 @@ class Apm:
         """The full flush target, <api_url>/apm/ingest. Read-only."""
         return self._api_url + "/apm/ingest"
 
+    @property
+    def deployment(self):
+        """The resolved Kubernetes deployment name, or None. Read-only."""
+        return self._kubernetes.get("deployment") if self._kubernetes else None
+
+    @property
+    def namespace(self):
+        """The resolved Kubernetes namespace, or None. Read-only."""
+        return self._kubernetes.get("namespace") if self._kubernetes else None
+
+    def _detect_kubernetes(self, deployment, namespace):
+        """Resolve the Kubernetes context once at init; None outside a cluster.
+
+        Explicit values (init arguments, then the ROOTTRACE_APM_DEPLOYMENT /
+        ROOTTRACE_APM_NAMESPACE env vars) win; in-cluster auto-detection only
+        fills the gaps, and only when KUBERNETES_SERVICE_HOST says the process
+        runs inside a cluster. Never raises.
+        """
+        deployment = _sanitize_k8s_name(deployment) or _sanitize_k8s_name(
+            env("ROOTTRACE_APM_DEPLOYMENT") or None)
+        namespace = _sanitize_k8s_name(namespace) or _sanitize_k8s_name(
+            env("ROOTTRACE_APM_NAMESPACE") or None)
+        in_cluster = bool(env("KUBERNETES_SERVICE_HOST"))
+        pod = _sanitize_k8s_name(self.hostname)
+        if in_cluster:
+            if deployment is None and pod:
+                deployment = _deployment_from_pod(pod)
+            if namespace is None:
+                try:
+                    with open(K8S_NAMESPACE_FILE, encoding="utf-8") as f:
+                        namespace = _sanitize_k8s_name(f.read())
+                except OSError:
+                    pass  # not readable; the namespace stays unknown
+        if not in_cluster and deployment is None and namespace is None:
+            return None  # the payload omits the kubernetes object entirely
+        kubernetes = {}
+        if deployment:
+            kubernetes["deployment"] = deployment
+        if namespace:
+            kubernetes["namespace"] = namespace
+        if pod:  # sent whenever the kubernetes object is: it's the hostname
+            kubernetes["pod"] = pod
+        return kubernetes or None
+
     def _start(self):
         self._thread = threading.Thread(
-            target=self._loop, name="roottrace-apm-flush", daemon=True
+            target=self._loop, name="roottrace_apm-flush", daemon=True
         )
         self._thread.start()
 
@@ -304,7 +385,7 @@ class Apm:
                         or duration_ms > min(s["duration_ms"] for s in samples)):
                     if len(samples) >= MAX_TRACE_SAMPLES:
                         samples.remove(min(samples, key=lambda s: s["duration_ms"]))
-                    samples.append({
+                    sample = {
                         "trace_id": tx.trace_id,
                         "transaction_name": tx.name,
                         "transaction_type": tx.type,
@@ -313,7 +394,10 @@ class Apm:
                         "outcome": outcome,
                         "spans_dropped": tx.spans_dropped,
                         "spans": list(tx.spans),
-                    })
+                    }
+                    if tx.http:
+                        sample["http"] = dict(tx.http)
+                    samples.append(sample)
                 key = (tx.name, tx.type)
                 group = self._tx_buffer.get(key)
                 if group is None:
@@ -508,6 +592,8 @@ class Apm:
         }
         if self.service_version:
             payload["service_version"] = self.service_version
+        if self._kubernetes:
+            payload["kubernetes"] = dict(self._kubernetes)
         if tx_snapshot:
             transactions = []
             for group in tx_snapshot.values():
@@ -617,7 +703,7 @@ class Apm:
                 "Authorization": f"Collector {self.token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": f"roottrace-apm-python/{VERSION}",
+                "User-Agent": f"roottrace_apm-python/{VERSION}",
                 "Connection": "close",
             },
             method="POST",
@@ -654,8 +740,15 @@ _warned_no_init = False
 
 def init(service=None, token=None, api_url=None, interval_seconds=None,
          tags=None, runtime_metrics=True, service_version=None,
-         http_instrumentation=True) -> Apm:
-    """Configure the singleton and start the background flush thread."""
+         http_instrumentation=True, db_instrumentation=True,
+         deployment=None, namespace=None) -> Apm:
+    """Configure the singleton and start the background flush thread.
+
+    ``db_instrumentation`` auto-instruments whichever supported database
+    clients are installed (pymongo/motor, Elasticsearch, redis, asyncpg,
+    SQLAlchemy) so transactions get db spans without code changes. For
+    MongoDB, call init() before constructing the client — pymongo only
+    applies listeners to clients created afterwards."""
     global _instance
     with _init_lock:
         if _instance is not None:
@@ -707,9 +800,15 @@ def init(service=None, token=None, api_url=None, interval_seconds=None,
             tags=tags,
             runtime_metrics=runtime_metrics,
             service_version=service_version,
+            deployment=deployment,
+            namespace=namespace,
         )
         if http_instrumentation:
             _instrument_http_client()
+            _instrument_httpx()
+            _instrument_aiohttp()
+        if db_instrumentation:
+            _instrument_databases()
         _instance._start()
         atexit.register(shutdown)
         return _instance
@@ -818,6 +917,7 @@ class _Transaction:
         self.spans_dropped = 0
         self.closed = False  # set once recorded; late spans then no-op
         self.failed = False  # forced by capture_exception(handled=False)
+        self.http = None  # request context; rides the trace sample when set
         self.breakdown = {}  # (type, subtype) -> {"count", "sum"}
         self._start = time.perf_counter()
         self._token = None  # contextvar reset token, set by whoever activates us
@@ -840,6 +940,41 @@ class _Transaction:
         span["start_offset_ms"] = start_offset_ms
         span["duration_ms"] = duration_ms
         self.spans.append(span)
+
+    def set_http(self, method=None, path=None, status_code=None,
+                 client_ip=None, remote_ip=None, user_agent=None):
+        """Attach request details to this transaction. When it wins a
+        trace-sample slot they ship as the sample's "http" object, so the
+        dashboard can show where a slow or failing request came from.
+        None leaves a field unset; values are clipped. Never raises."""
+        try:
+            http = self.http
+            if http is None:
+                http = self.http = {}
+            for key, value, cap in (
+                ("method", method, MAX_TX_TYPE_LENGTH),
+                ("path", path, MAX_HTTP_PATH_LENGTH),
+                ("client_ip", client_ip, MAX_HTTP_IP_LENGTH),
+                ("remote_ip", remote_ip, MAX_HTTP_IP_LENGTH),
+                ("user_agent", user_agent, MAX_HTTP_USER_AGENT_LENGTH),
+            ):
+                if value is not None:
+                    http[key] = str(value)[:cap]
+            if status_code is not None:
+                try:
+                    code = int(status_code)
+                except (TypeError, ValueError):
+                    code = None
+                # The server rejects codes outside 0-999 — and a rejected
+                # payload takes the whole flush down with it.
+                if code is not None and 0 <= code <= 999:
+                    http["status_code"] = code
+                else:
+                    _warn_throttled(("http-status-code", self.name),
+                                    "ignoring invalid status_code %r on transaction %r",
+                                    status_code, self.name)
+        except Exception:
+            logger.exception("failed to set http context on transaction %r", self.name)
 
 
 def _finish_transaction(tx, outcome):
@@ -1106,7 +1241,7 @@ def _instrument_http_client():
         _record("http.client.duration", "timer", tags, "ms", duration)
         _record("http.client.requests", "counter", tags, None, 1)
         tx = _current_transaction()
-        if tx is not None:
+        if tx is not None and not _span_suppressed.get():
             tx._add_span(f"{method} {destination}", "http", destination,
                          (start - tx._start) * 1000.0, duration)
 
@@ -1205,6 +1340,502 @@ def _instrument_http_client():
     _http_client_patched = True
 
 
+_httpx_patched = False
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _instrument_httpx():
+    """Patch httpx.Client.send / httpx.AsyncClient.send with the same
+    reporting as the http.client instrumentation. httpx rides httpcore,
+    not http.client, so it needs its own hook. send() is the funnel every
+    request passes through in both clients; with follow_redirects a whole
+    redirect chain is one call, recorded against the original destination
+    with the final status. Idempotent; missing httpx is not an error."""
+    global _httpx_patched
+    if _httpx_patched:
+        return
+    try:
+        import httpx
+    except ImportError:
+        return
+
+    original_send = httpx.Client.send
+    original_async_send = httpx.AsyncClient.send
+
+    def before(request):
+        # Returns the start time, or None when instrumentation is off.
+        if _instance is None or getattr(_self_calls, "active", False):
+            return None
+        try:
+            tx = _current_transaction()
+            if tx is not None and "traceparent" not in request.headers:
+                request.headers["traceparent"] = (
+                    f"00-{tx.trace_id}-{os.urandom(8).hex()}-01"
+                )
+        except Exception as exc:
+            _warn_throttled("httpx-request-instrumentation",
+                            "httpx instrumentation failed (%r); "
+                            "sending the request uninstrumented", exc)
+        return time.perf_counter()
+
+    def finish(request, start, status):
+        # Guarded: recording must never mask the response or the exception.
+        try:
+            if start is None or _instance is None:
+                return
+            duration = (time.perf_counter() - start) * 1000.0
+            host = request.url.host or "unknown"
+            port = request.url.port or _DEFAULT_PORTS.get(request.url.scheme)
+            destination = f"{host}:{port}" if port else host
+            tags = {"destination": destination, "status": status}
+            _record("http.client.duration", "timer", tags, "ms", duration)
+            _record("http.client.requests", "counter", tags, None, 1)
+            tx = _current_transaction()
+            if tx is not None and not _span_suppressed.get():
+                tx._add_span(f"{request.method} {destination}", "http", destination,
+                             (start - tx._start) * 1000.0, duration)
+        except Exception as exc:
+            _warn_throttled("httpx-response-instrumentation",
+                            "httpx instrumentation failed (%r); "
+                            "the call itself succeeded or raised as usual", exc)
+
+    def bucket(response):
+        status = response.status_code
+        return (f"{status // 100}xx"
+                if isinstance(status, int) and 100 <= status <= 599
+                else "unknown")
+
+    # BaseException, not Exception: asyncio cancellation (client
+    # disconnect, wait_for timeout) must still record the call as an
+    # error before re-raising, or cancelled requests vanish from APM.
+    @functools.wraps(original_send)
+    def send(client, request, **kwargs):
+        start = before(request)
+        try:
+            response = original_send(client, request, **kwargs)
+        except BaseException:
+            finish(request, start, "error")
+            raise
+        finish(request, start, bucket(response))
+        return response
+
+    @functools.wraps(original_async_send)
+    async def async_send(client, request, **kwargs):
+        start = before(request)
+        try:
+            response = await original_async_send(client, request, **kwargs)
+        except BaseException:
+            finish(request, start, "error")
+            raise
+        finish(request, start, bucket(response))
+        return response
+
+    httpx.Client.send = send
+    httpx.AsyncClient.send = async_send
+    _httpx_patched = True
+
+
+def _add_db_span(name, subtype, duration_ms, start_perf=None):
+    """Attach a db span to the active transaction; no-op without one.
+
+    When only a duration is known (pymongo listener events), the start
+    offset is back-computed from now. Guarded: never raises."""
+    try:
+        tx = _current_transaction()
+        if tx is None:
+            return
+        end = time.perf_counter()
+        start = start_perf if start_perf is not None else end - duration_ms / 1000.0
+        tx._add_span(name, "db", subtype, (start - tx._start) * 1000.0, duration_ms)
+    except Exception as exc:
+        _warn_throttled("db-span", "db span recording failed (%r)", exc)
+
+
+_SQL_TABLE_RE = re.compile(r"\b(?:from|into|update|join)\s+([A-Za-z0-9_.\"]+)",
+                           re.IGNORECASE)
+
+
+def _sql_span_name(statement):
+    # "SELECT users" / "INSERT orders": the operation plus a best-effort
+    # table name, never the statement itself (parameters may be inlined).
+    text = str(statement).strip()
+    if not text:
+        return "SQL"
+    op = text.split(None, 1)[0].upper()[:20]
+    match = _SQL_TABLE_RE.search(text)
+    return f"{op} {match.group(1)}" if match else op
+
+
+_aiohttp_patched = False
+
+
+def _instrument_aiohttp():
+    """Patch aiohttp.ClientSession._request with the same reporting as the
+    other HTTP hooks. _request is the funnel under get/post/etc. for both
+    plain sessions and clients built on aiohttp (async Elasticsearch, the
+    embedding service). Idempotent; missing aiohttp is not an error."""
+    global _aiohttp_patched
+    if _aiohttp_patched:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        return
+
+    original_request = aiohttp.ClientSession._request
+
+    def inject_traceparent(kwargs):
+        try:
+            if _instance is None:
+                return None
+            tx = _current_transaction()
+            if tx is None:
+                return time.perf_counter()
+            headers = kwargs.get("headers")
+            if headers is None:
+                kwargs["headers"] = {
+                    "traceparent": f"00-{tx.trace_id}-{os.urandom(8).hex()}-01"
+                }
+            elif hasattr(headers, "keys") and not any(
+                str(k).lower() == "traceparent" for k in headers.keys()
+            ):
+                headers = dict(headers)
+                headers["traceparent"] = f"00-{tx.trace_id}-{os.urandom(8).hex()}-01"
+                kwargs["headers"] = headers
+            # a list of pairs is passed through untouched: appending a
+            # duplicate traceparent would be worse than sending none
+        except Exception as exc:
+            _warn_throttled("aiohttp-request-instrumentation",
+                            "aiohttp instrumentation failed (%r); "
+                            "sending the request uninstrumented", exc)
+        return time.perf_counter()
+
+    def finish(method, url, response, start, status):
+        # Guarded: recording must never mask the response or the exception.
+        try:
+            if start is None or _instance is None:
+                return
+            duration = (time.perf_counter() - start) * 1000.0
+            target = response.url if response is not None else None
+            if target is None:
+                parts = urllib.parse.urlsplit(str(url))
+                host, port, scheme = parts.hostname, parts.port, parts.scheme
+            else:
+                host, port, scheme = target.host, target.port, target.scheme
+            port = port or _DEFAULT_PORTS.get(scheme)
+            destination = (f"{host}:{port}" if port else host) or "unknown"
+            tags = {"destination": destination, "status": status}
+            _record("http.client.duration", "timer", tags, "ms", duration)
+            _record("http.client.requests", "counter", tags, None, 1)
+            tx = _current_transaction()
+            if tx is not None and not _span_suppressed.get():
+                tx._add_span(f"{str(method).upper()} {destination}", "http",
+                             destination, (start - tx._start) * 1000.0, duration)
+        except Exception as exc:
+            _warn_throttled("aiohttp-response-instrumentation",
+                            "aiohttp instrumentation failed (%r); "
+                            "the call itself succeeded or raised as usual", exc)
+
+    @functools.wraps(original_request)
+    async def request(session, method, str_or_url, **kwargs):
+        start = inject_traceparent(kwargs)
+        try:
+            response = await original_request(session, method, str_or_url, **kwargs)
+        except BaseException:  # cancellation must still record, then re-raise
+            finish(method, str_or_url, None, start, "error")
+            raise
+        status = response.status
+        bucket = (f"{status // 100}xx"
+                  if isinstance(status, int) and 100 <= status <= 599
+                  else "unknown")
+        finish(method, str_or_url, response, start, bucket)
+        return response
+
+    aiohttp.ClientSession._request = request
+    _aiohttp_patched = True
+
+
+_pymongo_patched = False
+
+# Handshake, heartbeat, and auth traffic is driver bookkeeping, not
+# application work; it would drown real commands in the waterfall.
+_MONGO_SKIP_COMMANDS = frozenset((
+    "hello", "ismaster", "isMaster", "ping", "endSessions", "abortTransaction",
+    "saslStart", "saslContinue", "authenticate", "buildInfo", "getnonce",
+))
+
+
+def _make_mongo_listener():
+    """Build the pymongo CommandListener (module-level for tests)."""
+    from pymongo import monitoring
+
+    class Listener(monitoring.CommandListener):
+        def __init__(self):
+            # request_id -> collection, so succeeded/failed can name the
+            # span. Bounded: commands can fail without an event, so the
+            # map is cleared at a cap rather than trusted to drain.
+            self._pending = {}
+
+        def started(self, event):
+            try:
+                if event.command_name in _MONGO_SKIP_COMMANDS:
+                    return
+                if len(self._pending) > 2048:
+                    self._pending.clear()
+                target = event.command.get(event.command_name) if event.command else None
+                if isinstance(target, str):
+                    self._pending[event.request_id] = target
+            except Exception as exc:
+                _warn_throttled("pymongo-instrumentation",
+                                "mongodb span recording failed (%r)", exc)
+
+        def succeeded(self, event):
+            self._finish(event)
+
+        def failed(self, event):
+            self._finish(event)
+
+        def _finish(self, event):
+            try:
+                collection = self._pending.pop(event.request_id, None)
+                if event.command_name in _MONGO_SKIP_COMMANDS or _instance is None:
+                    return
+                database = getattr(event, "database_name", None)
+                scope = ".".join(p for p in (database, collection) if p)
+                name = f"{event.command_name} {scope}" if scope else event.command_name
+                _add_db_span(name, "mongodb", event.duration_micros / 1000.0)
+            except Exception as exc:
+                _warn_throttled("pymongo-instrumentation",
+                                "mongodb span recording failed (%r)", exc)
+
+    return Listener()
+
+
+def _patch_motor_context():
+    """Make motor's executor calls carry the caller's context, so pymongo
+    listener callbacks (which fire on those worker threads) can see the
+    active transaction. Without this, motor commands record no spans."""
+    try:
+        from motor import frameworks
+        module = frameworks.asyncio
+    except Exception:
+        return  # motor absent or reorganized; plain pymongo still works
+    if getattr(module, "_roottrace_apm_context", False):
+        return
+    original = module.run_on_executor
+
+    @functools.wraps(original)
+    def run_on_executor(loop, fn, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        return original(loop, functools.partial(ctx.run, fn), *args, **kwargs)
+
+    module.run_on_executor = run_on_executor
+    module._roottrace_apm_context = True
+
+
+def _instrument_pymongo():
+    """Register a global pymongo command listener. Global listeners only
+    apply to clients created afterwards, so init() must run before the
+    MongoClient / motor client is constructed."""
+    global _pymongo_patched
+    if _pymongo_patched:
+        return
+    try:
+        from pymongo import monitoring
+    except ImportError:
+        return
+    _patch_motor_context()
+    monitoring.register(_make_mongo_listener())
+    _pymongo_patched = True
+
+
+_elasticsearch_patched = False
+
+
+def _instrument_elasticsearch():
+    """Wrap Elasticsearch.perform_request (sync and async) in a db span.
+    The transport's own HTTP call is suppressed from the waterfall so one
+    query doesn't appear twice; http.client.* metrics still record."""
+    global _elasticsearch_patched
+    if _elasticsearch_patched:
+        return
+    try:
+        import elasticsearch
+    except ImportError:
+        return
+
+    def span_name(args, kwargs):
+        method = str(args[0]) if args else kwargs.get("method", "REQUEST")
+        path = str(args[1]) if len(args) > 1 else str(kwargs.get("path", "/"))
+        return f"{method} {_normalize_path(path)}"
+
+    def wrap_sync(original):
+        @functools.wraps(original)
+        def perform_request(client, *args, **kwargs):
+            start = time.perf_counter()
+            token = _span_suppressed.set(True)
+            try:
+                return original(client, *args, **kwargs)
+            finally:
+                _span_suppressed.reset(token)
+                _add_db_span(span_name(args, kwargs), "elasticsearch",
+                             (time.perf_counter() - start) * 1000.0, start)
+        return perform_request
+
+    def wrap_async(original):
+        @functools.wraps(original)
+        async def perform_request(client, *args, **kwargs):
+            start = time.perf_counter()
+            token = _span_suppressed.set(True)
+            try:
+                return await original(client, *args, **kwargs)
+            finally:
+                _span_suppressed.reset(token)
+                _add_db_span(span_name(args, kwargs), "elasticsearch",
+                             (time.perf_counter() - start) * 1000.0, start)
+        return perform_request
+
+    patched = False
+    sync_client = getattr(elasticsearch, "Elasticsearch", None)
+    if sync_client is not None and hasattr(sync_client, "perform_request"):
+        sync_client.perform_request = wrap_sync(sync_client.perform_request)
+        patched = True
+    async_client = getattr(elasticsearch, "AsyncElasticsearch", None)
+    if async_client is not None and hasattr(async_client, "perform_request"):
+        async_client.perform_request = wrap_async(async_client.perform_request)
+        patched = True
+    _elasticsearch_patched = patched
+
+
+_redis_patched = False
+
+
+def _instrument_redis():
+    """Wrap redis-py execute_command (sync and asyncio) in a db span named
+    by the command ("GET", "HSET", ...), never by key."""
+    global _redis_patched
+    if _redis_patched:
+        return
+    try:
+        import redis
+    except ImportError:
+        return
+
+    def wrap_sync(original):
+        @functools.wraps(original)
+        def execute_command(client, *args, **options):
+            start = time.perf_counter()
+            try:
+                return original(client, *args, **options)
+            finally:
+                _add_db_span(str(args[0]) if args else "COMMAND", "redis",
+                             (time.perf_counter() - start) * 1000.0, start)
+        return execute_command
+
+    def wrap_async(original):
+        @functools.wraps(original)
+        async def execute_command(client, *args, **options):
+            start = time.perf_counter()
+            try:
+                return await original(client, *args, **options)
+            finally:
+                _add_db_span(str(args[0]) if args else "COMMAND", "redis",
+                             (time.perf_counter() - start) * 1000.0, start)
+        return execute_command
+
+    redis.Redis.execute_command = wrap_sync(redis.Redis.execute_command)
+    try:
+        import redis.asyncio
+        redis.asyncio.Redis.execute_command = wrap_async(
+            redis.asyncio.Redis.execute_command)
+    except (ImportError, AttributeError):
+        pass  # asyncio flavor absent on old redis-py; sync still covered
+    _redis_patched = True
+
+
+_asyncpg_patched = False
+
+
+def _instrument_asyncpg():
+    """Wrap asyncpg Connection query methods in postgresql db spans."""
+    global _asyncpg_patched
+    if _asyncpg_patched:
+        return
+    try:
+        import asyncpg
+    except ImportError:
+        return
+
+    def wrap(original):
+        @functools.wraps(original)
+        async def method(conn, query, *args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return await original(conn, query, *args, **kwargs)
+            finally:
+                _add_db_span(_sql_span_name(query), "postgresql",
+                             (time.perf_counter() - start) * 1000.0, start)
+        return method
+
+    connection = asyncpg.connection.Connection
+    for name in ("execute", "executemany", "fetch", "fetchrow", "fetchval"):
+        if hasattr(connection, name):
+            setattr(connection, name, wrap(getattr(connection, name)))
+    _asyncpg_patched = True
+
+
+_sqlalchemy_patched = False
+
+
+def _instrument_sqlalchemy():
+    """Listen for cursor execution on every SQLAlchemy engine (present and
+    future: the listener attaches to the Engine class). Covers whatever
+    dialect the app uses — postgresql, mysql, sqlite — as the subtype."""
+    global _sqlalchemy_patched
+    if _sqlalchemy_patched:
+        return
+    try:
+        from sqlalchemy import event
+        from sqlalchemy.engine import Engine
+    except ImportError:
+        return
+
+    def before(conn, cursor, statement, parameters, context, executemany):
+        try:
+            conn.info.setdefault("_roottrace_apm_starts", []).append(time.perf_counter())
+        except Exception:
+            pass  # after() tolerates a missing start
+
+    def after(conn, cursor, statement, parameters, context, executemany):
+        try:
+            starts = conn.info.get("_roottrace_apm_starts")
+            if not starts:
+                return
+            start = starts.pop()
+            subtype = getattr(getattr(conn, "dialect", None), "name", None) or "sql"
+            _add_db_span(_sql_span_name(statement), subtype,
+                         (time.perf_counter() - start) * 1000.0, start)
+        except Exception as exc:
+            _warn_throttled("sqlalchemy-instrumentation",
+                            "sql span recording failed (%r)", exc)
+
+    event.listen(Engine, "before_cursor_execute", before)
+    event.listen(Engine, "after_cursor_execute", after)
+    _sqlalchemy_patched = True
+
+
+def _instrument_databases():
+    # Each hook no-ops when its library is missing and never raises.
+    for hook in (_instrument_pymongo, _instrument_elasticsearch,
+                 _instrument_redis, _instrument_asyncpg, _instrument_sqlalchemy):
+        try:
+            hook()
+        except Exception as exc:
+            _warn_throttled(("db-instrumentation", hook.__name__),
+                            "%s failed (%r); that client reports no spans",
+                            hook.__name__, exc)
+
+
 # Numeric, UUID-shaped, or long-hex (>=16 chars: Mongo ObjectIds, hashes)
 # path segments become ":id" in transaction names.
 _ID_SEGMENT_RE = re.compile(
@@ -1247,6 +1878,24 @@ class WsgiMiddleware:
             trace_id = (_parse_traceparent(environ.get("HTTP_TRACEPARENT"))
                         or os.urandom(16).hex())
             tx = _Transaction(name, "request", trace_id)
+            remote = environ.get("REMOTE_ADDR") or None
+            # client_ip is the first X-Forwarded-For hop — the caller's
+            # claim of the origin, spoofable by whoever sent the request.
+            # remote_ip is always the socket peer, so the one address the
+            # kernel vouches for survives whatever the header says.
+            client_ip = None
+            forwarded = environ.get("HTTP_X_FORWARDED_FOR")
+            if forwarded:
+                client_ip = forwarded.split(",")[0].strip() or None
+            path = environ.get("PATH_INFO", "")
+            query = environ.get("QUERY_STRING")
+            tx.set_http(
+                method=environ.get("REQUEST_METHOD", "GET"),
+                path=f"{path}?{query}" if query else path,
+                client_ip=client_ip or remote,
+                remote_ip=remote,
+                user_agent=environ.get("HTTP_USER_AGENT") or None,
+            )
             tx._token = _active_transaction.set(tx)
             return tx
         except Exception:
@@ -1294,6 +1943,10 @@ class WsgiMiddleware:
                     result.close()
                 status = captured.get("status", "")
                 bucket = f"{status[:1]}xx" if status[:1].isdigit() else "unknown"
+                # isdecimal, not isdigit: isdigit admits characters like
+                # superscripts that int() rejects, and this must not raise.
+                if tx is not None and status[:3].isdecimal():
+                    tx.set_http(status_code=int(status[:3]))
                 tags = {"method": environ.get("REQUEST_METHOD", "GET"), "status": bucket}
                 _record(self.name, "timer", tags, "ms",
                         (time.perf_counter() - start) * 1000.0)
