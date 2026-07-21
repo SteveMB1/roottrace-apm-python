@@ -31,3 +31,6 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-run tags no-op instead of failing on the upload conflict.
+          skip-existing: true
