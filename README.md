@@ -30,6 +30,28 @@ Every argument can come from an environment variable instead (see
 a missing service/token or a non-http(s) `api_url`; everything after a
 successful `init()` never raises into your application.
 
+### Attach a version — it unlocks deploy tracking
+
+Give each release a version and RootTrace marks the deploy on every chart,
+compares the new version against the hour before it shipped, and opens an
+issue if latency or errors regressed. Without a version, none of that can
+happen. Either in code:
+
+```python
+apm.init(service="checkout-api", token="rtc_...", service_version="1.4.2")
+```
+
+or with no code changes, from your deploy pipeline or Dockerfile:
+
+```dockerfile
+ARG BUILD_VERSION
+ENV ROOTTRACE_APM_SERVICE_VERSION=${BUILD_VERSION}
+```
+
+built with `--build-arg BUILD_VERSION=$(git rev-parse --short HEAD)` (or a
+build counter). Versions are capped at 64 characters — a build number or
+short git SHA is ideal.
+
 ### Metrics
 
 ```python
@@ -53,6 +75,9 @@ exit. `apm.flush()` forces a synchronous send; `apm.shutdown()` stops the
 thread and flushes a final time. The metric name `errors.count` is reserved
 for server-side error rollups; recordings under it are dropped with a
 warning.
+
+Timers also accumulate a latency histogram between flushes — see
+[Histograms](#histograms).
 
 ### Transactions and spans
 
@@ -93,6 +118,25 @@ except ValueError as exc:
 
 Errors group by a stable fingerprint (type + culprit + top stack frames),
 at most 25 distinct per flush.
+
+### Histograms
+
+Every timer metric and transaction group carries a `buckets` object
+alongside `count`/`sum`/`min`/`max`: a log2 histogram of the durations
+observed since the last flush, mapping a bucket index to a count. The
+index for a duration `d` in milliseconds is
+
+```
+i = min(127, max(0, floor(log2(max(d, 0.001)) * 4) + 40))
+```
+
+so 1ms lands in bucket 40, 1000ms in bucket 79, and sub-millisecond
+durations clamp toward 0. Four buckets per octave puts each bucket within
+about 19% of its neighbours, which is what lets the dashboard compute real
+percentiles instead of inferring them from an average. Buckets are additive
+and purely optional — a server that ignores the field still reads every
+other aggregate exactly as before, and a failed flush merges buckets back
+into the live buffer along with the rest.
 
 ### Outbound HTTP (requests, urllib3, urllib, httpx, aiohttp)
 
@@ -158,6 +202,116 @@ with apm.transaction("consume orders", type="task") as tx:
     tx.set_http(client_ip=peer, method="GET", path=raw_path, status_code=200)
 ```
 
+### ASGI (FastAPI, Starlette)
+
+```python
+from fastapi import FastAPI
+from roottrace_apm import AsgiMiddleware
+
+app = FastAPI()
+app.add_middleware(AsgiMiddleware)
+```
+
+The same metrics, transactions, trace context, and error capture as the
+WSGI middleware, over ASGI 3. Lifespan and websocket scopes pass straight
+through untouched.
+
+Transactions are named from the **route template** once the framework has
+resolved it — `GET /orders/{order_id}`, not `GET /orders/123` — which is
+what keeps transaction cardinality bounded. The name comes from the
+matched route the framework publishes on the ASGI scope (`scope["route"]`).
+
+**FastAPI publishes it; plain Starlette does not.** FastAPI's `APIRoute`
+puts itself on the scope when it matches, so FastAPI apps get route
+templates with no configuration. A plain Starlette `Route` only publishes
+`endpoint` and `path_params`, so a plain-Starlette app falls back to the
+raw path with parameters left in — `GET /orders/123` — and every distinct
+id becomes its own transaction group. With the cap at 250 groups per
+flush, an id-heavy Starlette app will churn through it. Name those
+transactions yourself until the framework exposes the route:
+
+```python
+with apm.transaction(f"GET /orders/{{order_id}}", type="request"):
+    ...
+```
+
+The same applies to any other ASGI framework that doesn't publish
+`scope["route"]`. Check your transaction list for id-shaped names.
+
+The middleware also starts the event-loop lag monitor on the first request
+(see below). Wrap the app as the outermost middleware if you want spans
+from other middleware to land inside the transaction.
+
+### Event-loop and scheduling lag
+
+Two gauges report where time goes that no span accounts for:
+
+- `python.eventloop.lag_ms` — the mean scheduling drift of the asyncio
+  loop since the last flush, sampled by a coroutine that sleeps 500ms and
+  measures how late it actually wakes. It's the number that tells you a
+  blocking call has snuck into async code. `AsgiMiddleware` starts the
+  monitor automatically; for a non-ASGI async app, call
+  `apm.watch_event_loop()` from inside the running loop:
+
+  ```python
+  async def main():
+      apm.watch_event_loop()
+      await serve()
+  ```
+
+  It's idempotent — repeated calls while the monitor is alive do nothing.
+
+- `process.gil.lag_ms` — the mean oversleep of a daemon thread napping in
+  a 100ms loop. Be honest about what this measures: it is **thread
+  scheduling delay**, not a direct GIL instrumentation. When the sampler
+  thread asks to wake after 100ms and wakes at 140ms, something kept it
+  from running. In CPython, GIL contention is the dominant cause of that
+  delay — a busy C-extension or a CPU-bound thread holding the lock — but
+  OS scheduling pressure, a noisy-neighbour container, and CPU throttling
+  land in the same number. Read it as a contention signal to investigate,
+  not as proof of a GIL stall.
+
+### Logs
+
+`RootTraceLogHandler` ships stdlib logging records to RootTrace on the same
+flush cadence as metrics, over the same token auth:
+
+```python
+import logging
+from roottrace_apm import RootTraceLogHandler
+
+inst = apm.init(service="checkout-api", token="rtc_...")
+logging.getLogger().addHandler(RootTraceLogHandler(inst))
+```
+
+Records batch in memory and POST to `<api_url>/logs/ingest` from the
+wrapper's existing background thread — no extra thread, no per-record
+request. Each entry carries the service, level, message, logger name,
+timestamp, and the `trace_id` of the active transaction when there is one,
+so a log line links to the trace it came from on the dashboard. A record
+logged via `logging.exception(...)` (or any record carrying `exc_info`)
+ships with its formatted traceback appended to the message, inside the
+8KB cap.
+
+Record extras ride along as `attrs`, with obvious secret-looking keys
+(`password`, `token`, `api_key`, `authorization`, `cookie`, ...) replaced
+by `[REDACTED]`:
+
+```python
+log.info("charged order", extra={"order_id": 7, "api_key": "sk-live-..."})
+# -> attrs: {"order_id": 7, "api_key": "[REDACTED]"}
+```
+
+That redaction is a coarse safety net keyed on attribute names, not a
+guarantee — a secret passed under an innocuous key, or interpolated into
+the message itself, still ships. Keep secrets out of log calls.
+
+At most 500 entries buffer between flushes; past that the oldest are
+dropped and the count is warned once per flush. Messages truncate at 8KB.
+`emit()` never raises into your application, and the wrapper's own
+`roottrace_apm` logger is skipped so its warnings can't feed back into
+themselves.
+
 ## Configuration
 
 Explicit `init()` arguments win over environment variables, which win over
@@ -171,7 +325,7 @@ defaults.
 | `interval_seconds` | `ROOTTRACE_APM_INTERVAL_SECONDS`                                 | 30 (clamped to 5–3600)        |
 | `tags`             | —                                                                | none (merged into every metric) |
 | `runtime_metrics`  | —                                                                | enabled                       |
-| `service_version`  | —                                                                | none (reported when set)      |
+| `service_version`  | `ROOTTRACE_APM_SERVICE_VERSION`                                  | none (reported when set)      |
 | `http_instrumentation` | —                                                            | enabled                       |
 | `deployment`       | `ROOTTRACE_APM_DEPLOYMENT`                                       | auto-detected in Kubernetes (≤253 chars) |
 | `namespace`        | `ROOTTRACE_APM_NAMESPACE`                                        | auto-detected in Kubernetes (≤253 chars) |
@@ -193,11 +347,16 @@ properties, for diagnostics and logging:
 inst = apm.init(...)
 inst.api_url     # e.g. "https://api.roottrace.io/api"
 inst.ingest_url  # api_url + "/apm/ingest", the flush target
+inst.logs_url    # api_url + "/logs/ingest", the log flush target
 ```
 
 Runtime metrics reported each flush: `process.memory.rss_bytes`,
 `process.cpu.percent`, `process.threads`, `process.gc.collections`,
-`process.uptime_seconds`.
+`process.uptime_seconds`, and `process.gil.lag_ms` (thread scheduling
+delay — see [above](#event-loop-and-scheduling-lag)). All of them, and the
+`process.gil.lag_ms` sampler thread, are disabled by
+`runtime_metrics=False`. `python.eventloop.lag_ms` is reported only once
+the event-loop monitor is running.
 
 ## Development
 

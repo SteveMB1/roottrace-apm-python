@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.1 - 2026-07-21
+
+- `RootTraceLogHandler` now includes the formatted traceback in the shipped
+  message when a record carries `exc_info` — so `logging.exception(...)`
+  ships what it prints, inside the same 8KB message cap. Previously the
+  traceback was silently dropped and an error log arrived as its first line
+  only.
+
+## 0.3.0 - 2026-07-15
+
+- Latency histograms: every timer metric and transaction group now carries
+  an optional `buckets` object — a log2 histogram (4 buckets per octave,
+  index `min(127, max(0, floor(log2(max(d, 0.001)) * 4) + 40))`, so 1ms is
+  bucket 40 and 1000ms is bucket 79) of the durations since the last flush,
+  so the dashboard can compute real percentiles instead of inferring them
+  from an average. Buckets merge back with everything else on a failed
+  flush. The field is additive and optional: servers that ignore it read
+  the payload exactly as before.
+- `AsgiMiddleware`: ASGI 3 middleware for FastAPI/Starlette with the same
+  metrics, transactions, `traceparent` adoption, request context, and error
+  capture as the WSGI middleware. Transactions are named from the resolved
+  route template (`GET /orders/{order_id}`) when the framework publishes
+  one, falling back to the raw path. Lifespan and websocket scopes pass
+  through untouched.
+- `python.eventloop.lag_ms` gauge: mean asyncio scheduling drift since the
+  last flush, sampled by a 500ms monitor coroutine. Started automatically
+  by `AsgiMiddleware`, or manually with `apm.watch_event_loop()`.
+- `process.gil.lag_ms` gauge: mean oversleep of a 100ms daemon sampler
+  thread. This measures thread scheduling delay, of which GIL contention is
+  the dominant cause in CPython — not a direct GIL instrumentation. Rides
+  `runtime_metrics`.
+- `RootTraceLogHandler`: a stdlib `logging.Handler` batching records
+  (service, level, message, logger, timestamp, active `trace_id`, and
+  redacted record extras) and POSTing them to `<api_url>/logs/ingest` on
+  the existing flush cadence, from the existing background thread. Caps at
+  500 buffered entries (drop-oldest, counted warning) and 8KB messages;
+  `emit()` never raises. The resolved endpoint is readable as
+  `inst.logs_url`.
+- `ROOTTRACE_APM_SERVICE_VERSION` environment fallback for
+  `service_version`, so deploy pipelines can report versions (deploy
+  markers, regression detection) without code changes.
+
 ## 0.2.0 - 2026-07-11
 
 - Automatic database spans (`db_instrumentation=True`, the default):

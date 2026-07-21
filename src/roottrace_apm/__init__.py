@@ -6,6 +6,7 @@ payload per flush interval to the RootTrace API. Stdlib only.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import contextvars
 import datetime
@@ -25,6 +26,7 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,7 +36,7 @@ try:
 except ImportError:  # not available on Windows
     resource = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.1"
 DEFAULT_API_URL = "https://api.roottrace.io/api"
 MAX_ENTRIES = 500  # wire cap per ingest request
 MAX_USER_ENTRIES = MAX_ENTRIES - 8  # headroom so runtime metrics fit under the cap
@@ -60,13 +62,17 @@ MAX_SAMPLE_SPANS = 100  # spans kept on one trace sample
 MAX_HTTP_PATH_LENGTH = 1024  # http context on trace samples (PROTOCOL.md)
 MAX_HTTP_USER_AGENT_LENGTH = 300
 MAX_HTTP_IP_LENGTH = 64  # fits IPv6 with a zone id
+MAX_HISTOGRAM_BUCKET = 127  # shared histogram contract: bucket indexes 0-127
+MAX_LOG_ENTRIES = 500  # log records buffered between flushes
+MAX_LOG_MESSAGE_LENGTH = 8192  # 8KB message truncation
 
 logger = logging.getLogger("roottrace_apm")
 
 __all__ = [
     "Apm", "Counter", "Gauge", "Timer", "Span", "WsgiMiddleware",
+    "AsgiMiddleware", "RootTraceLogHandler",
     "init", "counter", "gauge", "timer", "timed", "transaction", "span",
-    "capture_exception", "flush", "shutdown",
+    "capture_exception", "flush", "shutdown", "watch_event_loop",
     "VERSION",
 ]
 
@@ -167,6 +173,20 @@ def _deployment_from_pod(pod):
     return match.group(1) if match else pod
 
 
+def _bucket_index(duration_ms):
+    """Histogram bucket for a duration, per the shared wrapper contract.
+
+    i = min(127, max(0, floor(log2(max(d, 0.001)) * 4) + 40)), so 1ms -> 40,
+    1000ms -> 79, and sub-millisecond durations clamp toward 0."""
+    return min(MAX_HISTOGRAM_BUCKET,
+               max(0, math.floor(math.log2(max(duration_ms, 0.001)) * 4) + 40))
+
+
+def _merge_buckets(into, source):
+    for index, count in source.items():
+        into[index] = into.get(index, 0) + count
+
+
 def _tags_key(tags):
     # Canonical k=v,k=v form (PROTOCOL.md): percent-encode %, =, and , in
     # keys and values so distinct tag maps never collide. '%' goes first.
@@ -193,7 +213,7 @@ class Apm:
 
     def __init__(self, service, token, api_url=DEFAULT_API_URL, interval_seconds=30,
                  tags=None, runtime_metrics=True, service_version=None,
-                 deployment=None, namespace=None):
+                 deployment=None, namespace=None, commit_sha=None):
         self.service = service
         self.token = token
         self._api_url = api_url.rstrip("/")
@@ -206,12 +226,18 @@ class Apm:
             self.tags = {k: self.tags[k] for k in sorted(self.tags)[:MAX_TAG_KEYS]}
         self.runtime_metrics = runtime_metrics
         self.service_version = service_version
+        self.commit_sha = commit_sha
         self.hostname = socket.gethostname()
         self._kubernetes = self._detect_kubernetes(deployment, namespace)
         self._buffer = {}
         self._tx_buffer = {}  # (name, type) -> transaction group
         self._error_buffer = {}  # fingerprint -> error entry
         self._trace_samples = []  # up to MAX_TRACE_SAMPLES, slowest win
+        self._log_buffer = []  # RootTraceLogHandler entries, cap MAX_LOG_ENTRIES
+        self._logs_dropped = 0  # drop-oldest count since the last flush
+        self._loop_monitor = None  # asyncio task measuring event-loop lag
+        self._loop_lag = (0.0, 0)  # (drift sum ms, samples) since last flush
+        self._gil_lag = (0.0, 0)  # same, from the sampler thread
         self._lock = threading.Lock()
         self._flush_lock = threading.Lock()
         self._stop = threading.Event()
@@ -233,6 +259,11 @@ class Apm:
     def ingest_url(self):
         """The full flush target, <api_url>/apm/ingest. Read-only."""
         return self._api_url + "/apm/ingest"
+
+    @property
+    def logs_url(self):
+        """The log flush target, <api_url>/logs/ingest. Read-only."""
+        return self._api_url + "/logs/ingest"
 
     @property
     def deployment(self):
@@ -283,6 +314,10 @@ class Apm:
             target=self._loop, name="roottrace_apm-flush", daemon=True
         )
         self._thread.start()
+        if self.runtime_metrics:
+            threading.Thread(
+                target=self._gil_loop, name="roottrace_apm-gil", daemon=True
+            ).start()
 
     def _loop(self):
         while not self._stop.wait(self.interval_seconds):
@@ -291,6 +326,85 @@ class Apm:
             except Exception:
                 # flush handles send errors itself; this keeps the loop alive
                 logger.exception("background flush failed")
+
+    def watch_event_loop(self):
+        """Start the event-loop lag monitor on the running loop.
+
+        Reports the mean scheduling drift since the last flush as the
+        `python.eventloop.lag_ms` gauge. Started automatically by
+        AsgiMiddleware on the first request; call it yourself from loop
+        code to monitor a non-ASGI app. Idempotent while the monitor is
+        alive; a no-op (with a warning) outside a running loop. Never
+        raises."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._warn_throttled("eventloop-monitor",
+                                 "watch_event_loop() needs a running event loop; not started")
+            return
+        try:
+            with self._lock:
+                if self._loop_monitor is not None and not self._loop_monitor.done():
+                    return
+                self._loop_monitor = loop.create_task(self._monitor_event_loop())
+        except Exception:
+            logger.exception("failed to start the event-loop lag monitor")
+
+    async def _monitor_event_loop(self):
+        loop = asyncio.get_running_loop()
+        while not self._stop.is_set():
+            before = loop.time()
+            await asyncio.sleep(0.5)
+            drift = max((loop.time() - before - 0.5) * 1000.0, 0.0)
+            with self._lock:
+                total, count = self._loop_lag
+                self._loop_lag = (total + drift, count + 1)
+
+    def _gil_loop(self):
+        # Oversleep of a 100ms nap = how long this thread waited to be
+        # rescheduled; in CPython that's dominated by GIL contention.
+        while not self._stop.is_set():
+            start = time.perf_counter()
+            time.sleep(0.1)
+            drift = max((time.perf_counter() - start - 0.1) * 1000.0, 0.0)
+            with self._lock:
+                total, count = self._gil_lag
+                self._gil_lag = (total + drift, count + 1)
+
+    def _record_lag_gauges(self, snapshot):
+        # Independent of runtime_metrics: the monitors only run when someone
+        # started them, and their samples must not survive into the next flush.
+        try:
+            with self._lock:
+                loop_lag, self._loop_lag = self._loop_lag, (0.0, 0)
+                gil_lag, self._gil_lag = self._gil_lag, (0.0, 0)
+            if loop_lag[1]:
+                self._snapshot_record(snapshot, "python.eventloop.lag_ms", "gauge",
+                                      "ms", loop_lag[0] / loop_lag[1])
+            if gil_lag[1]:
+                self._snapshot_record(snapshot, "process.gil.lag_ms", "gauge",
+                                      "ms", gil_lag[0] / gil_lag[1])
+        except Exception:
+            logger.exception("lag gauge collection failed")
+
+    def _record_log(self, entry):
+        # Called from RootTraceLogHandler.emit; must never raise.
+        try:
+            dropped = False
+            with self._lock:
+                if len(self._log_buffer) >= MAX_LOG_ENTRIES:
+                    self._log_buffer.pop(0)
+                    self._logs_dropped += 1
+                    dropped = True
+                self._log_buffer.append(entry)
+            if dropped:  # warned outside the lock: the warning may re-enter emit()
+                self._warn_throttled(
+                    "log-cap",
+                    "log buffer full at %d entries; dropping the oldest",
+                    MAX_LOG_ENTRIES,
+                )
+        except Exception:
+            logger.exception("failed to buffer log record")
 
     def _warn_throttled(self, key, msg, *args):
         # At most one warning per key per flush interval; flush clears the set.
@@ -352,7 +466,7 @@ class Apm:
                     if kind == "counter":
                         entry.update(count=0, sum=0.0)
                     elif kind == "timer":
-                        entry.update(count=0, sum=0.0, min=value, max=value)
+                        entry.update(count=0, sum=0.0, min=value, max=value, buckets={})
                     self._buffer[key] = entry
                 if entry["kind"] != kind:
                     logger.warning("metric %r is a %s; ignoring %s recording",
@@ -366,6 +480,8 @@ class Apm:
                     entry["sum"] += value
                     entry["min"] = min(entry["min"], value)
                     entry["max"] = max(entry["max"], value)
+                    bucket = _bucket_index(value)
+                    entry["buckets"][bucket] = entry["buckets"].get(bucket, 0) + 1
                 else:
                     entry["value"] = value
         except Exception:
@@ -411,12 +527,14 @@ class Apm:
                     group = {"name": tx.name, "type": tx.type,
                              "count": 0, "sum": 0.0,
                              "min": duration_ms, "max": duration_ms,
-                             "success": 0, "failed": 0, "spans": {}}
+                             "success": 0, "failed": 0, "spans": {}, "buckets": {}}
                     self._tx_buffer[key] = group
                 group["count"] += 1
                 group["sum"] += duration_ms
                 group["min"] = min(group["min"], duration_ms)
                 group["max"] = max(group["max"], duration_ms)
+                bucket = _bucket_index(duration_ms)
+                group["buckets"][bucket] = group["buckets"].get(bucket, 0) + 1
                 group[outcome] += 1
                 for span_key, row in tx.breakdown.items():
                     existing = group["spans"].get(span_key)
@@ -526,24 +644,61 @@ class Apm:
                 self._error_buffer = {}
                 trace_snapshot = self._trace_samples
                 self._trace_samples = []
+                log_snapshot = self._log_buffer
+                self._log_buffer = []
+                logs_dropped, self._logs_dropped = self._logs_dropped, 0
                 self._warned.clear()
+            if logs_dropped:
+                logger.warning("dropped %d log records since the last flush: buffer at its cap",
+                               logs_dropped)
             if self.runtime_metrics:
                 self._record_runtime(snapshot)
+            self._record_lag_gauges(snapshot)
             buffers = (snapshot, tx_snapshot, err_snapshot, trace_snapshot)
-            if not any(buffers):
-                return
-            payload = self._build_payload(*buffers)
-            try:
-                self._send(payload)
-            except _UnserializableError as exc:
-                logger.warning("dropping %d unserializable metric entries: %s",
-                               len(payload["metrics"]), exc)
-            except _HttpStatusError as exc:
-                self._handle_http_error(buffers, payload, exc)
-            except Exception as exc:
-                logger.warning("flush of %d metric entries failed: %s",
-                               len(payload["metrics"]), exc)
-                self._merge_back(*buffers)
+            if any(buffers):
+                payload = self._build_payload(*buffers)
+                try:
+                    self._send(payload)
+                except _UnserializableError as exc:
+                    logger.warning("dropping %d unserializable metric entries: %s",
+                                   len(payload["metrics"]), exc)
+                except _HttpStatusError as exc:
+                    self._handle_http_error(buffers, payload, exc)
+                except Exception as exc:
+                    logger.warning("flush of %d metric entries failed: %s",
+                                   len(payload["metrics"]), exc)
+                    self._merge_back(*buffers)
+            if log_snapshot:
+                self._flush_logs(log_snapshot)
+
+    def _flush_logs(self, entries):
+        try:
+            self._send_logs({"service": self.service, "logs": entries})
+        except _UnserializableError as exc:
+            logger.warning("dropping %d unserializable log records: %s", len(entries), exc)
+        except _HttpStatusError as exc:
+            if 400 <= exc.code < 500 and exc.code != 429:
+                logger.warning("dropping %d log records rejected by the API: %s",
+                               len(entries), exc)
+            else:
+                self._merge_back_logs(entries, exc)
+        except Exception as exc:
+            self._merge_back_logs(entries, exc)
+
+    def _merge_back_logs(self, entries, exc):
+        # Unsent records go back in front of whatever accumulated meanwhile;
+        # the cap drops the oldest. Guarded: the failure path must not raise.
+        logger.warning("flush of %d log records failed: %s", len(entries), exc)
+        try:
+            with self._lock:
+                combined = entries + self._log_buffer
+                overflow = len(combined) - MAX_LOG_ENTRIES
+                if overflow > 0:
+                    self._logs_dropped += overflow
+                    combined = combined[overflow:]
+                self._log_buffer = combined
+        except Exception:
+            logger.exception("merge-back of unsent log records failed; data lost")
 
     def _handle_http_error(self, buffers, payload, exc):
         if exc.code == 429:
@@ -577,6 +732,10 @@ class Apm:
             for field in ("count", "sum", "min", "max", "value"):
                 if field in entry:
                     metric[field] = entry[field]
+            if entry.get("buckets"):
+                # stringified indexes: the buckets object is JSON, additive,
+                # and ignored by servers that predate histograms
+                metric["buckets"] = {str(i): c for i, c in entry["buckets"].items()}
             metrics.append(metric)
         payload = {
             "service": self.service,
@@ -592,6 +751,8 @@ class Apm:
         }
         if self.service_version:
             payload["service_version"] = self.service_version
+        if self.commit_sha:
+            payload["commit_sha"] = self.commit_sha
         if self._kubernetes:
             payload["kubernetes"] = dict(self._kubernetes)
         if tx_snapshot:
@@ -601,6 +762,8 @@ class Apm:
                          "count": group["count"], "sum": group["sum"],
                          "min": group["min"], "max": group["max"],
                          "success": group["success"], "failed": group["failed"]}
+                if group.get("buckets"):
+                    entry["buckets"] = {str(i): c for i, c in group["buckets"].items()}
                 if group["spans"]:
                     rows = []
                     for (span_type, subtype), row in group["spans"].items():
@@ -647,6 +810,7 @@ class Apm:
                         if old["kind"] == "timer":
                             entry["min"] = min(entry["min"], old["min"])
                             entry["max"] = max(entry["max"], old["max"])
+                            _merge_buckets(entry["buckets"], old.get("buckets", {}))
                 for key, old in (tx_snapshot or {}).items():
                     group = self._tx_buffer.get(key)
                     if group is None:
@@ -661,6 +825,7 @@ class Apm:
                     group["max"] = max(group["max"], old["max"])
                     group["success"] += old["success"]
                     group["failed"] += old["failed"]
+                    _merge_buckets(group["buckets"], old.get("buckets", {}))
                     for span_key, row in old["spans"].items():
                         existing = group["spans"].get(span_key)
                         if existing is None:
@@ -690,6 +855,12 @@ class Apm:
             logger.warning("dropped %d unsent entries: buffers at their caps", dropped)
 
     def _send(self, payload):
+        self._post(self.ingest_url, payload)
+
+    def _send_logs(self, payload):
+        self._post(self.logs_url, payload)
+
+    def _post(self, url, payload):
         # Serialization gets its own try: a ValueError from the request below
         # (e.g. a bad URL) must not masquerade as a poison payload.
         try:
@@ -697,7 +868,7 @@ class Apm:
         except (TypeError, ValueError) as exc:
             raise _UnserializableError(exc) from exc
         request = urllib.request.Request(
-            self.ingest_url,
+            url,
             data=body,
             headers={
                 "Authorization": f"Collector {self.token}",
@@ -741,7 +912,7 @@ _warned_no_init = False
 def init(service=None, token=None, api_url=None, interval_seconds=None,
          tags=None, runtime_metrics=True, service_version=None,
          http_instrumentation=True, db_instrumentation=True,
-         deployment=None, namespace=None) -> Apm:
+         deployment=None, namespace=None, commit_sha=None) -> Apm:
     """Configure the singleton and start the background flush thread.
 
     ``db_instrumentation`` auto-instruments whichever supported database
@@ -757,6 +928,14 @@ def init(service=None, token=None, api_url=None, interval_seconds=None,
         service = service or env("ROOTTRACE_APM_SERVICE")
         token = token or env("ROOTTRACE_APM_TOKEN") or env("ROOTTRACE_COLLECTOR_TOKEN")
         api_url = api_url or env("ROOTTRACE_API_URL", DEFAULT_API_URL)
+        if service_version is None:
+            # Deploy pipelines set this without touching app code; versions
+            # power the dashboard's deploy markers and regression checks.
+            service_version = env("ROOTTRACE_APM_SERVICE_VERSION") or None
+        if commit_sha is None:
+            # Binds the version to a git commit for regression findings.
+            # GITHUB_SHA is the fallback so GitHub Actions works untouched.
+            commit_sha = env("ROOTTRACE_APM_COMMIT_SHA") or env("GITHUB_SHA") or None
         if interval_seconds is None:
             raw = env("ROOTTRACE_APM_INTERVAL_SECONDS") or "30"
             try:
@@ -802,6 +981,7 @@ def init(service=None, token=None, api_url=None, interval_seconds=None,
             service_version=service_version,
             deployment=deployment,
             namespace=namespace,
+            commit_sha=(str(commit_sha)[:64] if commit_sha else None),
         )
         if http_instrumentation:
             _instrument_http_client()
@@ -1190,6 +1370,12 @@ def capture_exception(exc, handled=True):
 def flush():
     if _instance is not None:
         _instance.flush()
+
+
+def watch_event_loop():
+    """Start the event-loop lag monitor on the current running loop."""
+    if _instance is not None:
+        _instance.watch_event_loop()
 
 
 def shutdown():
@@ -1955,3 +2141,174 @@ class WsgiMiddleware:
                 self._finish_request(tx, outcome, error)
 
         return stream(result)
+
+
+class AsgiMiddleware:
+    """ASGI 3 middleware (FastAPI, Starlette, ...): wraps each http request
+    in a transaction and records the http.request.duration timer and
+    http.requests counter, tagged by method and status class. Non-http
+    scopes (lifespan, websocket) pass straight through."""
+
+    def __init__(self, app, name="http.request.duration"):
+        self.app = app
+        self.name = name
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        tx = self._start_transaction(scope)
+        start = time.perf_counter()
+        captured = {}
+
+        async def wrapped_send(message):
+            try:
+                if message.get("type") == "http.response.start":
+                    captured["status"] = message.get("status")
+            except Exception:
+                logger.exception("failed to capture response status")
+            await send(message)
+
+        error = None
+        try:
+            await self.app(scope, receive, wrapped_send)
+        except Exception as exc:
+            error = exc
+            raise  # unchanged; instrumentation happens in finally
+        finally:
+            self._finish_request(scope, tx, captured.get("status"), start, error)
+
+    def _start_transaction(self, scope):
+        # Guarded: the middleware must serve the request even if APM breaks.
+        try:
+            apm = _instance
+            if apm is not None:
+                apm.watch_event_loop()  # idempotent; we are on the loop here
+            wanted = {"traceparent": None, "x-forwarded-for": None, "user-agent": None}
+            for key, value in scope.get("headers") or ():
+                name = bytes(key).decode("latin-1").lower()
+                if name in wanted and wanted[name] is None:  # first occurrence wins
+                    wanted[name] = bytes(value).decode("latin-1")
+            method = str(scope.get("method") or "GET")
+            path = scope.get("path") or "/"
+            # Named from the raw path for now; _finish_request switches to the
+            # route template once the framework has resolved it.
+            trace_id = _parse_traceparent(wanted["traceparent"]) or os.urandom(16).hex()
+            tx = _Transaction(f"{method} {path}", "request", trace_id)
+            client = scope.get("client")
+            remote = client[0] if client else None
+            client_ip = None
+            if wanted["x-forwarded-for"]:
+                client_ip = wanted["x-forwarded-for"].split(",")[0].strip() or None
+            query = scope.get("query_string") or b""
+            if isinstance(query, (bytes, bytearray)):
+                query = bytes(query).decode("latin-1")
+            tx.set_http(
+                method=method,
+                path=f"{path}?{query}" if query else path,
+                client_ip=client_ip or remote,
+                remote_ip=remote,
+                user_agent=wanted["user-agent"] or None,
+            )
+            tx._token = _active_transaction.set(tx)
+            return tx
+        except Exception:
+            logger.exception("failed to start request transaction")
+            return None
+
+    def _finish_request(self, scope, tx, status, start, error):
+        try:
+            bucket = (f"{status // 100}xx"
+                      if isinstance(status, int) and 100 <= status <= 599
+                      else "unknown")
+            method = str(scope.get("method") or "GET")
+            if tx is not None:
+                # Starlette/FastAPI put the matched route on the scope after
+                # routing; its template path is the low-cardinality name.
+                route_path = getattr(scope.get("route"), "path", None)
+                if isinstance(route_path, str) and route_path:
+                    tx.name = f"{method} {route_path}"[:MAX_NAME_LENGTH]
+                if status is not None:
+                    tx.set_http(status_code=status)
+            tags = {"method": method, "status": bucket}
+            _record(self.name, "timer", tags, "ms",
+                    (time.perf_counter() - start) * 1000.0)
+            _record("http.requests", "counter", tags, None, 1)
+            if tx is None:
+                return
+            if error is not None:
+                _capture_error(error, tx.name)
+            try:
+                _active_transaction.reset(tx._token)
+            except ValueError:  # finished in a different context than started
+                _active_transaction.set(None)
+            outcome = "failed" if (error is not None or bucket == "5xx") else "success"
+            _finish_transaction(tx, outcome)
+        except Exception:
+            logger.exception("failed to finish request transaction")
+
+
+# Attribute names every LogRecord carries; anything else on a record is a
+# user extra. Built from a probe record so it tracks the running Python.
+_LOG_RECORD_ATTRS = frozenset(
+    vars(logging.LogRecord("", 0, "", 0, "", (), None))
+) | {"message", "asctime", "taskName"}
+
+_SECRET_ATTR_RE = re.compile(
+    r"(?i)(?:password|passwd|pwd|secret|token|api[-_]?key|authorization"
+    r"|credential|private[-_]?key|cookie|session)"
+)
+
+
+class RootTraceLogHandler(logging.Handler):
+    """stdlib logging handler shipping records to RootTrace.
+
+    Batches records in memory (cap 500, drop-oldest) and POSTs them to
+    <api_url>/logs/ingest on the wrapper's existing flush cadence, with the
+    same token auth. Messages are truncated at 8KB; record extras ride along
+    as `attrs` with obvious secret-looking keys redacted. Never raises from
+    emit()."""
+
+    def __init__(self, apm, level=logging.NOTSET):
+        super().__init__(level)
+        self.apm = apm
+
+    def emit(self, record):
+        try:
+            if record.name == "roottrace_apm":
+                return  # never feed the wrapper's own logging back into itself
+            message = record.getMessage()
+            # logging.exception attaches exc_info; a shipped error log without
+            # its traceback is half a log, so it rides in the message the way
+            # a StreamHandler would print it, inside the same 8KB cap.
+            if record.exc_info and record.exc_info[0] is not None:
+                message = f"{message}\n{''.join(traceback.format_exception(*record.exc_info))}"
+            elif record.exc_text:
+                message = f"{message}\n{record.exc_text}"
+            entry = {
+                "service": self.apm.service,
+                "level": record.levelname,
+                "message": message[:MAX_LOG_MESSAGE_LENGTH],
+                "logger": record.name,
+                "timestamp": datetime.datetime.fromtimestamp(
+                    record.created, datetime.timezone.utc
+                ).isoformat(),
+            }
+            tx = _current_transaction()
+            if tx is not None:
+                entry["trace_id"] = tx.trace_id
+            attrs = {}
+            for key, value in record.__dict__.items():
+                if key in _LOG_RECORD_ATTRS or key.startswith("_"):
+                    continue
+                if _SECRET_ATTR_RE.search(key):
+                    attrs[key] = "[REDACTED]"
+                elif isinstance(value, (str, int, float, bool)) or value is None:
+                    attrs[key] = value
+                else:
+                    attrs[key] = str(value)[:MAX_LOG_MESSAGE_LENGTH]
+            if attrs:
+                entry["attrs"] = attrs
+            self.apm._record_log(entry)
+        except Exception:
+            self.handleError(record)

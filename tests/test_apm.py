@@ -3,6 +3,7 @@ import contextvars
 import http.client
 import http.server
 import json
+import logging
 import os
 import socket
 import threading
@@ -43,8 +44,10 @@ except ImportError:  # the elasticsearch patch test is optional
 
 import roottrace_apm as apm_mod
 from roottrace_apm import (
-    MAX_ENTRIES, MAX_ERRORS, MAX_NAME_LENGTH, MAX_TAG_KEYS, MAX_TX_GROUPS,
-    MAX_USER_ENTRIES, Apm, WsgiMiddleware, _HttpStatusError, _UnserializableError,
+    MAX_ENTRIES, MAX_ERRORS, MAX_LOG_ENTRIES, MAX_LOG_MESSAGE_LENGTH,
+    MAX_NAME_LENGTH, MAX_TAG_KEYS, MAX_TX_GROUPS, MAX_USER_ENTRIES,
+    Apm, AsgiMiddleware, RootTraceLogHandler, WsgiMiddleware,
+    _HttpStatusError, _UnserializableError,
 )
 
 VALID_TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
@@ -139,6 +142,7 @@ class ApmTest(ApmTestCase):
                 "sum": 300.0,
                 "min": 3.0,
                 "max": 250.0,
+                "buckets": {"46": 1, "62": 1, "71": 1},
             },
         )
 
@@ -1133,7 +1137,8 @@ class PayloadAndMergeBackTest(ApmTestCase):
         (tx_entry,) = payload["transactions"]
         self.assertEqual(
             set(tx_entry),
-            {"name", "type", "count", "sum", "min", "max", "success", "failed", "spans"},
+            {"name", "type", "count", "sum", "min", "max", "success", "failed",
+             "spans", "buckets"},
         )
         self.assertEqual(tx_entry["name"], "GET /checkout")
         self.assertEqual(tx_entry["type"], "request")
@@ -1441,6 +1446,408 @@ class ElasticsearchPatchTest(unittest.TestCase):
         before = elasticsearch.Elasticsearch.perform_request
         apm_mod._instrument_elasticsearch()  # idempotent
         self.assertIs(elasticsearch.Elasticsearch.perform_request, before)
+
+
+class HistogramBucketTest(ApmTestCase):
+    def test_bucket_index_exact_values(self):
+        self.assertEqual(apm_mod._bucket_index(1.0), 40)
+        self.assertEqual(apm_mod._bucket_index(1000.0), 79)
+        self.assertEqual(apm_mod._bucket_index(0.5), 36)
+        # sub-ms clamps toward 0; huge durations clamp at 127
+        self.assertEqual(apm_mod._bucket_index(0.0), 0)
+        self.assertEqual(apm_mod._bucket_index(-5.0), 0)
+        self.assertEqual(apm_mod._bucket_index(1e12), 127)
+
+    def test_timer_buckets_accumulate_and_ride_the_payload(self):
+        t = apm_mod.timer("latency")
+        t.record(1.0)
+        t.record(1.0)
+        t.record(1000.0)
+
+        entry = self.apm._buffer[("latency", "")]
+        self.assertEqual(entry["buckets"], {40: 2, 79: 1})
+
+        self.apm.flush()
+        (metric,) = self.sent[0]["metrics"]
+        # stringified indexes on the wire, and still JSON-serializable
+        self.assertEqual(metric["buckets"], {"40": 2, "79": 1})
+        json.dumps(self.sent[0])
+
+    def test_transaction_group_buckets(self):
+        for duration in (1.0, 1.0, 1000.0):
+            tx = apm_mod._Transaction("t", "request", os.urandom(16).hex())
+            self.apm._record_transaction(tx, duration, "success")
+
+        group = self.apm._tx_buffer[("t", "request")]
+        self.assertEqual(group["buckets"], {40: 2, 79: 1})
+
+        self.apm.flush()
+        (tx_entry,) = self.sent[0]["transactions"]
+        self.assertEqual(tx_entry["buckets"], {"40": 2, "79": 1})
+
+    def test_merge_back_merges_buckets(self):
+        apm_mod.timer("latency").record(1.0)
+        tx = apm_mod._Transaction("t", "request", os.urandom(16).hex())
+        self.apm._record_transaction(tx, 1.0, "success")
+
+        def failing_send(payload):
+            raise RuntimeError("boom")
+
+        self.apm._send = failing_send
+        with self.assertLogs("roottrace_apm", level="WARNING"):
+            self.apm.flush()
+
+        apm_mod.timer("latency").record(1.0)
+        apm_mod.timer("latency").record(1000.0)
+        tx = apm_mod._Transaction("t", "request", os.urandom(16).hex())
+        self.apm._record_transaction(tx, 1000.0, "success")
+        self.apm._send = self.sent.append
+        self.apm.flush()
+
+        metrics = {m["name"]: m for m in self.sent[0]["metrics"]}
+        self.assertEqual(metrics["latency"]["buckets"], {"40": 2, "79": 1})
+        (group,) = self.sent[0]["transactions"]
+        self.assertEqual(group["buckets"], {"40": 1, "79": 1})
+
+
+class LogHandlerTest(ApmTestCase):
+    def _logger(self):
+        log = logging.Logger("app.orders")  # standalone: no global registry
+        log.addHandler(RootTraceLogHandler(self.apm))
+        return log
+
+    def test_records_batched_with_fields(self):
+        log = self._logger()
+        log.info("hello %s", "world", extra={"order_id": 7, "api_key": "sk-1234"})
+
+        (entry,) = self.apm._log_buffer
+        self.assertEqual(entry["service"], "svc")
+        self.assertEqual(entry["level"], "INFO")
+        self.assertEqual(entry["message"], "hello world")
+        self.assertEqual(entry["logger"], "app.orders")
+        self.assertIn("T", entry["timestamp"])  # ISO 8601
+        self.assertNotIn("trace_id", entry)
+        # extras ride as attrs; secret-looking keys are redacted
+        self.assertEqual(entry["attrs"], {"order_id": 7, "api_key": "[REDACTED]"})
+
+    def test_trace_id_from_active_transaction(self):
+        log = self._logger()
+        with apm_mod.transaction("job", type="task") as tx:
+            log.warning("inside")
+        log.warning("outside")
+
+        inside, outside = self.apm._log_buffer
+        self.assertEqual(inside["trace_id"], tx.trace_id)
+        self.assertNotIn("trace_id", outside)
+
+    def test_message_truncated_at_8kb(self):
+        log = self._logger()
+        log.error("x" * (MAX_LOG_MESSAGE_LENGTH + 500))
+
+        (entry,) = self.apm._log_buffer
+        self.assertEqual(len(entry["message"]), MAX_LOG_MESSAGE_LENGTH)
+
+    def test_cap_drops_oldest_with_counted_warning(self):
+        log = self._logger()
+        with self.assertLogs("roottrace_apm", level="WARNING") as cm:
+            for i in range(MAX_LOG_ENTRIES + 5):
+                log.info("m%d", i)
+
+        self.assertEqual(len(self.apm._log_buffer), MAX_LOG_ENTRIES)
+        self.assertEqual(self.apm._logs_dropped, 5)
+        self.assertEqual(self.apm._log_buffer[0]["message"], "m5")  # oldest gone
+        cap_warnings = [r for r in cm.records if "log buffer full" in r.getMessage()]
+        self.assertEqual(len(cap_warnings), 1)  # throttled
+
+    def test_flush_posts_logs_and_resets_buffer(self):
+        posted = []
+        self.apm._send_logs = posted.append
+        log = self._logger()
+        log.info("one")
+        log.info("two")
+
+        self.apm.flush()
+
+        (payload,) = posted
+        json.dumps(payload)
+        self.assertEqual(payload["service"], "svc")
+        self.assertEqual([e["message"] for e in payload["logs"]], ["one", "two"])
+        self.assertEqual(self.apm._log_buffer, [])
+        self.assertEqual(self.sent, [])  # no metrics, so no metric flush
+
+    def test_failed_log_flush_merges_back(self):
+        log = self._logger()
+        log.info("kept")
+
+        def failing_send(payload):
+            raise RuntimeError("boom")
+
+        self.apm._send_logs = failing_send
+        with self.assertLogs("roottrace_apm", level="WARNING"):
+            self.apm.flush()
+
+        log.info("newer")
+        # unsent records precede whatever arrived meanwhile
+        self.assertEqual([e["message"] for e in self.apm._log_buffer],
+                         ["kept", "newer"])
+
+    def test_4xx_drops_log_batch(self):
+        log = self._logger()
+        log.info("rejected")
+
+        def send_422(payload):
+            raise _HttpStatusError(422, "malformed")
+
+        self.apm._send_logs = send_422
+        with self.assertLogs("roottrace_apm", level="WARNING"):
+            self.apm.flush()
+
+        self.assertEqual(self.apm._log_buffer, [])
+
+    def test_emit_never_raises(self):
+        log = self._logger()
+        old = logging.raiseExceptions
+        logging.raiseExceptions = False  # keep handleError quiet
+        try:
+            log.info("%d", "not-a-number")  # getMessage() raises inside emit
+        finally:
+            logging.raiseExceptions = old
+        self.assertEqual(self.apm._log_buffer, [])
+
+    def test_own_logger_records_skipped(self):
+        handler = RootTraceLogHandler(self.apm)
+        apm_logger = logging.Logger("roottrace_apm")
+        apm_logger.addHandler(handler)
+        apm_logger.warning("internal")
+        self.assertEqual(self.apm._log_buffer, [])
+
+
+class AsgiTest(ApmTestCase):
+    def _scope(self, path="/", method="GET", headers=None, **extra):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": headers or [],
+            "client": ("10.0.0.9", 51000),
+            "server": ("127.0.0.1", 80),
+        }
+        scope.update(extra)
+        return scope
+
+    def _app(self, status=200, route_path=None):
+        async def app(scope, receive, send):
+            if route_path is not None:  # what Starlette does after routing
+                scope["route"] = types.SimpleNamespace(path=route_path)
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"ok"})
+        return app
+
+    def _run(self, mw, scope):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(mw(scope, receive, send))
+        return sent
+
+    def test_raw_path_fallback_and_metrics(self):
+        mw = AsgiMiddleware(self._app())
+        sent = self._run(mw, self._scope("/orders/123"))
+
+        self.assertEqual(sent[-1]["body"], b"ok")
+        # no route on the scope: the raw path, parameters left as-is
+        group = self.apm._tx_buffer[("GET /orders/123", "request")]
+        self.assertEqual(group["count"], 1)
+        self.assertEqual(group["success"], 1)
+        tags_key = "method=GET,status=2xx"
+        self.assertEqual(self.apm._buffer[("http.request.duration", tags_key)]["count"], 1)
+        self.assertEqual(self.apm._buffer[("http.requests", tags_key)]["count"], 1)
+
+    def test_route_template_names_transaction(self):
+        mw = AsgiMiddleware(self._app(route_path="/orders/{order_id}"))
+        self._run(mw, self._scope("/orders/123"))
+
+        self.assertIn(("GET /orders/{order_id}", "request"), self.apm._tx_buffer)
+        # the raw path still rides the trace sample's http context
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["http"]["path"], "/orders/123")
+
+    def test_non_http_scopes_pass_through(self):
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append(scope["type"])
+
+        mw = AsgiMiddleware(app)
+        for scope_type in ("lifespan", "websocket"):
+            asyncio.run(mw({"type": scope_type}, None, None))
+
+        self.assertEqual(seen, ["lifespan", "websocket"])
+        self.assertEqual(self.apm._tx_buffer, {})
+        self.assertEqual(self.apm._buffer, {})
+
+    def test_adopts_valid_traceparent(self):
+        mw = AsgiMiddleware(self._app())
+        headers = [(b"traceparent", VALID_TRACEPARENT.upper().encode())]
+        self._run(mw, self._scope(headers=headers))
+
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["trace_id"], "0af7651916cd43dd8448eb211c80319c")
+
+    def test_captures_http_context(self):
+        mw = AsgiMiddleware(self._app(status=404))
+        headers = [(b"x-forwarded-for", b"203.0.113.7, 10.0.0.1"),
+                   (b"user-agent", b"pytest-agent")]
+        self._run(mw, self._scope("/orders/7", headers=headers,
+                                  query_string=b"page=2"))
+
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["http"], {
+            "method": "GET",
+            "path": "/orders/7?page=2",
+            "client_ip": "203.0.113.7",  # first X-Forwarded-For hop
+            "remote_ip": "10.0.0.9",     # the socket peer, kept alongside
+            "user_agent": "pytest-agent",
+            "status_code": 404,
+        })
+
+    def test_5xx_marks_failed(self):
+        mw = AsgiMiddleware(self._app(status=500))
+        self._run(mw, self._scope("/boom"))
+
+        group = self.apm._tx_buffer[("GET /boom", "request")]
+        self.assertEqual(group["failed"], 1)
+        self.assertEqual(group["success"], 0)
+
+    def test_exception_captured_and_reraised(self):
+        async def app(scope, receive, send):
+            raise RuntimeError("kaboom")
+
+        mw = AsgiMiddleware(app)
+        with self.assertRaises(RuntimeError):
+            self._run(mw, self._scope("/explode"))
+
+        group = self.apm._tx_buffer[("GET /explode", "request")]
+        self.assertEqual(group["failed"], 1)
+        (error,) = self.apm._error_buffer.values()
+        self.assertEqual(error["type"], "RuntimeError")
+        self.assertEqual(error["transaction_name"], "GET /explode")
+        # no http.response.start was sent, so the status is unknown
+        tags_key = "method=GET,status=unknown"
+        self.assertEqual(self.apm._buffer[("http.requests", tags_key)]["count"], 1)
+
+    def test_starts_event_loop_monitor(self):
+        self.assertIsNone(self.apm._loop_monitor)
+        mw = AsgiMiddleware(self._app())
+        self._run(mw, self._scope())
+        self.assertIsNotNone(self.apm._loop_monitor)
+
+    def test_spans_attach_to_the_request_transaction(self):
+        async def app(scope, receive, send):
+            with apm_mod.span("q", type="db", subtype="postgresql"):
+                pass
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        mw = AsgiMiddleware(app)
+        self._run(mw, self._scope("/db"))
+
+        group = self.apm._tx_buffer[("GET /db", "request")]
+        self.assertEqual(group["spans"][("db", "postgresql")]["count"], 1)
+
+    def test_starlette_falls_back_to_the_raw_path(self):
+        # Plain Starlette does NOT publish scope["route"] — it only sets
+        # "endpoint" and "path_params" — so there is no route template to
+        # read and the raw path stands, ids and all. Documented in the
+        # README: name these transactions yourself.
+        try:
+            import pytest
+        except ImportError:
+            self.skipTest("pytest is not installed")
+        pytest.importorskip("starlette")
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        async def order(request):
+            return PlainTextResponse("ok")
+
+        app = Starlette(routes=[Route("/orders/{order_id}", order)])
+        mw = AsgiMiddleware(app)
+        self._run(mw, self._scope("/orders/123"))
+
+        self.assertIn(("GET /orders/123", "request"), self.apm._tx_buffer)
+
+    def test_fastapi_route_template(self):
+        # FastAPI's APIRoute.matches does child_scope["route"] = self, and
+        # APIRoute.path is the template: this is the framework the route
+        # naming actually works on.
+        try:
+            import pytest
+        except ImportError:
+            self.skipTest("pytest is not installed")
+        pytest.importorskip("fastapi")
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+        @app.get("/orders/{order_id}")
+        async def order(order_id: str):
+            return {"ok": order_id}
+
+        mw = AsgiMiddleware(app)
+        self._run(mw, self._scope("/orders/123"))
+
+        self.assertIn(("GET /orders/{order_id}", "request"), self.apm._tx_buffer)
+        # the raw path still rides the trace sample's http context
+        (sample,) = self.apm._trace_samples
+        self.assertEqual(sample["http"]["path"], "/orders/123")
+
+
+class EventLoopLagTest(ApmTestCase):
+    def test_watch_outside_a_loop_warns_and_does_not_start(self):
+        with self.assertLogs("roottrace_apm", level="WARNING"):
+            self.apm.watch_event_loop()
+        self.assertIsNone(self.apm._loop_monitor)
+
+    def test_watch_is_idempotent_while_alive(self):
+        async def run():
+            self.apm.watch_event_loop()
+            first = self.apm._loop_monitor
+            self.apm.watch_event_loop()
+            self.assertIs(self.apm._loop_monitor, first)
+            first.cancel()
+
+        asyncio.run(run())
+
+    def test_mean_lag_reported_and_reset_on_flush(self):
+        self.apm._loop_lag = (30.0, 3)
+        self.apm._gil_lag = (5.0, 2)
+        self.apm.flush()
+
+        metrics = {m["name"]: m for m in self.sent[0]["metrics"]}
+        self.assertEqual(metrics["python.eventloop.lag_ms"]["value"], 10.0)
+        self.assertEqual(metrics["python.eventloop.lag_ms"]["kind"], "gauge")
+        self.assertEqual(metrics["process.gil.lag_ms"]["value"], 2.5)
+        self.assertEqual(self.apm._loop_lag, (0.0, 0))
+        self.assertEqual(self.apm._gil_lag, (0.0, 0))
+
+    def test_no_samples_no_gauges(self):
+        apm_mod.counter("jobs").add()
+        self.apm.flush()
+        names = {m["name"] for m in self.sent[0]["metrics"]}
+        self.assertNotIn("python.eventloop.lag_ms", names)
+        self.assertNotIn("process.gil.lag_ms", names)
 
 
 if __name__ == "__main__":
