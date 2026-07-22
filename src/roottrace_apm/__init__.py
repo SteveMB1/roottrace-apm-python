@@ -665,8 +665,8 @@ class Apm:
                 except _HttpStatusError as exc:
                     self._handle_http_error(buffers, payload, exc)
                 except Exception as exc:
-                    logger.warning("flush of %d metric entries failed: %s",
-                                   len(payload["metrics"]), exc)
+                    logger.warning("flush of %d metric entries to %s failed: %s",
+                                   len(payload["metrics"]), self.ingest_url, exc)
                     self._merge_back(*buffers)
             if log_snapshot:
                 self._flush_logs(log_snapshot)
@@ -688,7 +688,8 @@ class Apm:
     def _merge_back_logs(self, entries, exc):
         # Unsent records go back in front of whatever accumulated meanwhile;
         # the cap drops the oldest. Guarded: the failure path must not raise.
-        logger.warning("flush of %d log records failed: %s", len(entries), exc)
+        logger.warning("flush of %d log records to %s failed: %s",
+                       len(entries), self.logs_url, exc)
         try:
             with self._lock:
                 combined = entries + self._log_buffer
@@ -717,8 +718,8 @@ class Apm:
             logger.warning("dropping %d metric entries rejected by the API: %s",
                            len(payload["metrics"]), exc)
         else:
-            logger.warning("flush of %d metric entries failed: %s",
-                           len(payload["metrics"]), exc)
+            logger.warning("flush of %d metric entries to %s failed: %s",
+                           len(payload["metrics"]), self.ingest_url, exc)
             self._merge_back(*buffers)
 
     def _build_payload(self, snapshot, tx_snapshot, err_snapshot, trace_snapshot):
