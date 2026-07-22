@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 - 2026-07-22
+
+- Flush-failure warnings now name the endpoint they were sending to
+  (`flush of N metric entries to <url> failed: ...`), so a DNS or
+  connectivity failure points at the host that needs fixing instead of
+  leaving the target implicit.
+
 ## 0.3.1 - 2026-07-21
 
 - `RootTraceLogHandler` now includes the formatted traceback in the shipped

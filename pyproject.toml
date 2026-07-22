@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roottrace_apm"
-version = "0.3.1"
+version = "0.3.2"
 description = "RootTrace APM agent for Python: transactions, spans, error capture, outbound HTTP monitoring, and custom metrics with zero dependencies."
 readme = "README.md"
 license = { text = "Apache-2.0" }
