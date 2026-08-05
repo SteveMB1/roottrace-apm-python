@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.4 - 2026-08-05
+
+- **Fixed: the wrapper reported itself as 0.4.2 for the whole of 0.4.3.** The
+  0.4.3 release bumped the packaging metadata and left the `VERSION` constant
+  behind, so every 0.4.3 install sent `wrapper_version: "0.4.2"` on each ingest
+  payload and a `roottrace_apm-python/0.4.2` User-Agent. Only the reported
+  version was wrong; nothing else behaved differently.
+- **0.4.3 is gone from PyPI and is not coming back.** On 2026-08-05 every
+  roottrace-apm file disappeared from the index. Why it happened has not been
+  established. PyPI never allows a deleted filename to be uploaded again, so
+  0.4.3 cannot be restored and this release replaces it. There are no other
+  changes: 0.4.4 is 0.4.3 plus the version fix above.
+
 ## 0.4.3 - 2026-07-31
 
 - **Security sinks.** The wrapper now reports when instrumented code reaches a

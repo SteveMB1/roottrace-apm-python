@@ -30,7 +30,12 @@ jobs:
         with:
           name: dist
           path: dist/
+      # skip-existing is deliberately NOT set. It was, to make a re-run tag a
+      # no-op instead of an upload conflict, but it cannot tell a re-run from a
+      # filename PyPI refuses to reissue: both come back as "already exists"
+      # and both were reported as success. After the 0.4.3 files were deleted
+      # from the index that distinction is the whole question, and a green run
+      # that uploaded nothing is the worst answer to it. A genuine re-run of an
+      # already-published tag now fails loudly, which is the rarer case and the
+      # safer one to be wrong about.
       - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # Re-run tags no-op instead of failing on the upload conflict.
-          skip-existing: true
