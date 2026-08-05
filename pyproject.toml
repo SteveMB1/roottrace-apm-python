@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roottrace_apm"
+version = "0.4.3"
+description = "RootTrace APM agent for Python: transactions, spans, error capture, outbound HTTP monitoring, and custom metrics with zero dependencies."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "RootTrace" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["apm", "monitoring", "metrics", "tracing", "observability", "roottrace"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/SteveMB1/roottrace-apm-python"
+Repository = "https://github.com/SteveMB1/roottrace-apm-python"
+Issues = "https://github.com/SteveMB1/roottrace-apm-python/issues"
+Changelog = "https://github.com/SteveMB1/roottrace-apm-python/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+roottrace_apm = ["py.typed"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+# Selected explicitly rather than inherited. Ruff's default rule set is not a
+# stable contract: 0.16 widened it, and a CI step that installs the latest ruff
+# then lints against whatever that version happens to enable will fail one day
+# on code nobody touched. These four are the historical default and the ones
+# this project has always been held to.
+#
+# BLE001 ("do not catch blind Exception") is deliberately NOT enabled. Catching
+# broad exceptions is this wrapper's central safety property -- instrumentation
+# must never raise into the host application -- so the rule contradicts the
+# design rather than finding bugs in it. Adopting more rules is a decision to
+# make on purpose, not something to inherit from a dependency bump.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
